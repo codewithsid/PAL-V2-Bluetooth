@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PAL V2 Telemetry</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #07111f; color: #e9f3ff; }
+    body { max-width: 1280px; margin: 0 auto; padding: 24px; } h1 { margin: 0; font-size: 1.8rem; }
+    header, .controls, .grid { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    header { justify-content: space-between; margin-bottom: 20px; } button { background: #19b394; border: 0; border-radius: 8px; padding: 10px 14px; color: #001e18; font-weight: 700; cursor: pointer; } button.secondary { background: #1c3048; color: #dbeaff; } button:disabled { cursor: not-allowed; opacity: .45; }
+    #status { color: #92b8d8; font-size: .9rem; } .grid { align-items: stretch; display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); margin-top: 18px; }
+    section { background: #0d1d30; border: 1px solid #193652; border-radius: 12px; padding: 14px; min-height: 210px; } h2 { font-size: 1rem; margin: 0 0 12px; color: #a9d9ff; } canvas { width: 100%; height: 170px; background: #091522; border-radius: 6px; } .values { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-variant-numeric: tabular-nums; } .value { background:#081525; padding:8px; border-radius:6px; } .label { color:#89a9c5; display:block; font-size:.75rem; }
+    dialog { background:#10243a; color:inherit; border:1px solid #31587e; border-radius:12px; padding:20px; } dialog input { width:100%; box-sizing:border-box; padding:10px; margin:10px 0; } small { color:#89a9c5; }
+  </style>
+</head>
+<body>
+  <header><div><h1>PAL V2 Telemetry</h1><small>USB serial or Bluetooth LE • local CSV export</small></div><span id="status">Not connected</span></header>
+  <div class="controls"><button id="usb">Connect USB</button><button id="ble">Connect Bluetooth LE</button><button id="record">● Start recording</button><button id="stop" class="secondary" disabled>■ Stop recording</button><button id="play" class="secondary" disabled>▶ Play audio</button><button id="clock" class="secondary">Set RTC to current UTC time</button><button id="save" class="secondary">Download CSV</button><button id="clear" class="secondary">Clear data</button></div>
+  <div class="grid">
+    <section><h2>Acceleration (m/s²)</h2><canvas id="accel"></canvas></section>
+    <section><h2>Gyroscope (rad/s)</h2><canvas id="gyro"></canvas></section>
+    <section><h2>Microphone level (dBFS) <small id="audioValue">—</small></h2><canvas id="audio"></canvas></section>
+    <section><h2>Environment</h2><div class="values" id="env"><div class="value"><span class="label">Temperature</span>—</div><div class="value"><span class="label">Humidity</span>—</div><div class="value"><span class="label">Pressure</span>—</div><div class="value"><span class="label">Gas resistance</span>—</div></div></section>
+  </div>
+  <script>
+    const SERVICE = '7f510001-5b8d-4a84-9c7c-a07142ab6001', DATA = '7f510002-5b8d-4a84-9c7c-a07142ab6001', COMMAND = '7f510003-5b8d-4a84-9c7c-a07142ab6001';
+    const encoder = new TextEncoder(), buffers = { usb: '', ble: '' };
+    let serialWriter, commandCharacteristic, bleDevice, activeTransport, rows = [], reconnectTimer;
+    let recording = false, audioChunks = [], recordedAudioRate = 8000, playbackSource;
+    const histories = { accel: [], gyro: [], audio: [] }, status = document.querySelector('#status');
+    const setStatus = text => status.textContent = text;
+    function receive(text, transport) {
+      if (transport !== activeTransport) return;
+      buffers[transport] += text;
+      let newline;
+      while ((newline = buffers[transport].indexOf('\n')) >= 0) {
+        const line = buffers[transport].slice(0, newline).trim();
+        buffers[transport] = buffers[transport].slice(newline + 1);
+        if (!line) continue;
+        try { process(JSON.parse(line)); } catch (_) { setStatus(`Ignored malformed ${transport.toUpperCase()} packet`); }
+      }
+    }
+    function process(data) {
+      if (data.type === 'status') { setStatus(data.state + ': ' + data.detail); return; }
+      if (data.type === 'environment') { if (recording) rows.push({ time_ms:data.time_ms, type:'environment', temperature_c:data.temperature_c, humidity_pct:data.humidity_pct, pressure_hpa:data.pressure_hpa, gas_ohms:data.gas_ohms }); showEnv(data); return; }
+      if (data.type !== 'telemetry' || !Array.isArray(data.imu)) return;
+      data.imu.forEach(s => { const time = Number(data.time_ms) + s[0]; if (recording) rows.push({time_ms:time,type:'imu',ax:s[1],ay:s[2],az:s[3],gx:s[4],gy:s[5],gz:s[6]}); histories.accel.push([s[1],s[2],s[3]]); histories.gyro.push([s[4],s[5],s[6]]); });
+      const audioDbfs = Number(data.audio_dbfs);
+      if (recording) {
+        rows.push({time_ms:data.audio_time_ms ?? data.time_ms,type:'audio',audio_samples:data.audio_samples,audio_dbfs:audioDbfs});
+        if (data.audio_pcm_s8_b64) {
+          const binary = atob(data.audio_pcm_s8_b64), chunk = new Int8Array(binary.length);
+          for (let i=0; i<binary.length; i++) chunk[i] = binary.charCodeAt(i);
+          audioChunks.push(chunk); recordedAudioRate = Number(data.audio_rate_hz) || 8000;
+        }
+      }
+      histories.audio.push([Number.isFinite(audioDbfs) ? audioDbfs : -120]);
+      const audioValue = document.querySelector('#audioValue');
+      if (!data.audio_samples) audioValue.textContent = 'no I2S samples';
+      else if (audioDbfs <= -120) audioValue.textContent = '≤ −120 dBFS — check microphone wiring';
+      else audioValue.textContent = `${audioDbfs.toFixed(1)} dBFS`;
+      for (const key of Object.keys(histories)) { histories[key] = histories[key].slice(-180); draw(key); }
+    }
+    function showEnv(d) { document.querySelector('#env').innerHTML = `<div class="value"><span class="label">Temperature</span>${d.temperature_c} °C</div><div class="value"><span class="label">Humidity</span>${d.humidity_pct} %</div><div class="value"><span class="label">Pressure</span>${d.pressure_hpa} hPa</div><div class="value"><span class="label">Gas resistance</span>${Number(d.gas_ohms).toLocaleString()} Ω</div>`; }
+    function draw(key) {
+      const canvas = document.querySelector('#' + key), values = histories[key], ctx = canvas.getContext('2d');
+      const w = canvas.width = canvas.clientWidth * devicePixelRatio, h = canvas.height = canvas.clientHeight * devicePixelRatio;
+      ctx.clearRect(0,0,w,h); if (!values.length) return;
+      if (key === 'audio') {
+        ctx.strokeStyle='#36c7ff'; ctx.lineWidth=2*devicePixelRatio; ctx.beginPath();
+        values.forEach((row,i) => { const x=i*w/Math.max(1,values.length-1), db=Math.max(-120,Math.min(0,row[0])), y=(-db/120)*(h-12*devicePixelRatio); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+        ctx.stroke(); return;
+      }
+      const max = Math.max(1, ...values.flat().map(Math.abs)), colors = ['#36c7ff','#ffbb44','#ee5d9a'];
+      for (let col=0; col<values[0].length; col++) { ctx.strokeStyle=colors[col]; ctx.lineWidth=2*devicePixelRatio; ctx.beginPath(); values.forEach((row,i) => { const x=i*w/Math.max(1,values.length-1), y=h/2-(row[col]/max)*(h*.44); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });ctx.stroke(); }
+    }
+    async function readUsb(port) {
+      const reader = port.readable.getReader(), decoder = new TextDecoder();
+      try {
+        while (true) { const {value,done}=await reader.read(); if(done) break; receive(decoder.decode(value,{stream:true}),'usb'); }
+      } catch (error) {
+        if (activeTransport === 'usb') setStatus('USB disconnected: '+error.message);
+      } finally {
+        reader.releaseLock();
+        if (activeTransport === 'usb') { activeTransport=undefined; serialWriter=undefined; }
+      }
+    }
+    async function connectUsb() {
+      if (!navigator.serial) { setStatus('Web Serial requires Chromium on localhost or HTTPS'); return; }
+      try {
+        const port=await navigator.serial.requestPort(); await port.open({baudRate:115200});
+        serialWriter=port.writable.getWriter(); activeTransport='usb'; buffers.usb=''; setStatus('USB connected');
+        readUsb(port);
+      } catch(e) { setStatus('USB: '+e.message); }
+    }
+    async function openBleConnection(device) {
+      const server=await device.gatt.connect(), service=await server.getPrimaryService(SERVICE);
+      const data=await service.getCharacteristic(DATA); commandCharacteristic=await service.getCharacteristic(COMMAND);
+      await data.startNotifications();
+      data.addEventListener('characteristicvaluechanged', e=>receive(new TextDecoder().decode(e.target.value),'ble'));
+      activeTransport='ble'; buffers.ble=''; setStatus('Bluetooth LE connected');
+    }
+    function handleBleDisconnect() {
+      commandCharacteristic=undefined;
+      if (activeTransport !== 'ble') return;
+      setStatus('Bluetooth disconnected; reconnecting…');
+      let attempts=0;
+      const retry=async()=>{ try { await openBleConnection(bleDevice); } catch (_) { if (++attempts<5) reconnectTimer=setTimeout(retry,Math.min(8000,500*2**attempts)); else { activeTransport=undefined; setStatus('Bluetooth reconnect failed; click Connect Bluetooth LE'); } } };
+      reconnectTimer=setTimeout(retry,500);
+    }
+    async function connectBle() {
+      if (!navigator.bluetooth) { setStatus('Web Bluetooth requires Chromium on localhost or HTTPS'); return; }
+      try {
+        clearTimeout(reconnectTimer);
+        bleDevice=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+        bleDevice.removeEventListener('gattserverdisconnected',handleBleDisconnect);
+        bleDevice.addEventListener('gattserverdisconnected',handleBleDisconnect);
+        await openBleConnection(bleDevice);
+      } catch(e) { setStatus('Bluetooth: '+e.message); }
+    }
+    async function sendCommand(command) {
+      const value=encoder.encode(JSON.stringify(command)+'\n');
+      if(activeTransport==='usb' && serialWriter) { await serialWriter.write(value); return; }
+      if(activeTransport==='ble' && commandCharacteristic) { await commandCharacteristic.writeValueWithResponse(value); return; }
+      throw new Error('Connect USB or Bluetooth first');
+    }
+    async function startRecording() {
+      if (!activeTransport) { setStatus('Connect USB or Bluetooth before recording'); return; }
+      try {
+        await sendCommand({cmd:'start_audio'}); rows=[]; audioChunks=[]; recording=true;
+        document.querySelector('#record').disabled=true; document.querySelector('#stop').disabled=false; document.querySelector('#play').disabled=true;
+        setStatus('Recording sensor data and audio…');
+      } catch (error) { setStatus('Could not start recording: '+error.message); }
+    }
+    async function stopRecording() {
+      try { await sendCommand({cmd:'stop_audio'}); } catch (error) { setStatus('Audio stop command failed: '+error.message); }
+      recording=false; document.querySelector('#record').disabled=false; document.querySelector('#stop').disabled=true; document.querySelector('#play').disabled=!audioChunks.length;
+      const samples=audioChunks.reduce((total,chunk)=>total+chunk.length,0);
+      setStatus(`Recording stopped: ${rows.length.toLocaleString()} rows, ${(samples/recordedAudioRate).toFixed(1)} s audio`);
+    }
+    async function playAudio() {
+      if (!audioChunks.length) { setStatus('No recorded audio to play'); return; }
+      if (playbackSource) { try { playbackSource.stop(); } catch (_) {} }
+      const context=new AudioContext(), total=audioChunks.reduce((sum,chunk)=>sum+chunk.length,0), audioBuffer=context.createBuffer(1,total,recordedAudioRate), channel=audioBuffer.getChannelData(0);
+      let offset=0; for (const chunk of audioChunks) { for (let i=0;i<chunk.length;i++) channel[offset++]=chunk[i]/128; }
+      playbackSource=context.createBufferSource(); playbackSource.buffer=audioBuffer; playbackSource.connect(context.destination); playbackSource.start(); setStatus(`Playing ${(total/recordedAudioRate).toFixed(1)} s recorded audio`);
+      playbackSource.onended=()=>{ playbackSource=undefined; setStatus('Audio playback complete'); context.close(); };
+    }
+    document.querySelector('#usb').onclick=connectUsb; document.querySelector('#ble').onclick=connectBle;
+    document.querySelector('#record').onclick=startRecording; document.querySelector('#stop').onclick=stopRecording; document.querySelector('#play').onclick=playAudio;
+    document.querySelector('#clock').onclick=async()=>{ try { await sendCommand({cmd:'set_time',unix_ms:Date.now()}); setStatus('Clock update sent'); } catch(e) { setStatus(e.message); } };
+    document.querySelector('#clear').onclick=()=>{ recording=false; rows=[]; audioChunks=[]; document.querySelector('#record').disabled=false; document.querySelector('#stop').disabled=true; document.querySelector('#play').disabled=true; for(const k in histories) histories[k]=[]; document.querySelectorAll('canvas').forEach(c=>c.getContext('2d').clearRect(0,0,c.width,c.height)); setStatus('Recorded data cleared'); };
+    document.querySelector('#save').onclick=()=>{ if(!rows.length){setStatus('No recorded data to export');return;} const csvRows=rows.map(({time_ms,...values})=>({date_time:new Date(Number(time_ms)).toISOString(),...values})), keys=[...new Set(csvRows.flatMap(Object.keys))], escape=value=>`"${String(value??'').replaceAll('"','""')}"`, csv=[keys.join(','),...csvRows.map(r=>keys.map(k=>escape(r[k])).join(','))].join('\n'); const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})), a=Object.assign(document.createElement('a'),{href:url,download:`pal-v2-${new Date().toISOString().replace(/[:.]/g,'-')}.csv`});a.click();setTimeout(()=>URL.revokeObjectURL(url),1000); };
+    if (!window.isSecureContext) setStatus('Serve this dashboard from localhost or HTTPS to connect');
+  </script>
+</body>
+</html>
