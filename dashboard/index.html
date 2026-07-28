@@ -3,33 +3,553 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PAL V2 Telemetry</title>
+  <title>PAL V2 Pro Telemetry</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #07111f; color: #e9f3ff; }
-    body { max-width: 1280px; margin: 0 auto; padding: 24px; } h1 { margin: 0; font-size: 1.8rem; }
-    header, .controls, .grid { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    header { justify-content: space-between; margin-bottom: 20px; } button { background: #19b394; border: 0; border-radius: 8px; padding: 10px 14px; color: #001e18; font-weight: 700; cursor: pointer; } button.secondary { background: #1c3048; color: #dbeaff; } button:disabled { cursor: not-allowed; opacity: .45; }
-    #status { color: #92b8d8; font-size: .9rem; } .grid { align-items: stretch; display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); margin-top: 18px; }
-    section { background: #0d1d30; border: 1px solid #193652; border-radius: 12px; padding: 14px; min-height: 210px; } h2 { font-size: 1rem; margin: 0 0 12px; color: #a9d9ff; } canvas { width: 100%; height: 170px; background: #091522; border-radius: 6px; } .values { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-variant-numeric: tabular-nums; } .value { background:#081525; padding:8px; border-radius:6px; } .label { color:#89a9c5; display:block; font-size:.75rem; }
-    dialog { background:#10243a; color:inherit; border:1px solid #31587e; border-radius:12px; padding:20px; } dialog input { width:100%; box-sizing:border-box; padding:10px; margin:10px 0; } small { color:#89a9c5; }
+    :root {
+      color-scheme: dark;
+      --bg-black: #000000;
+      --card-bg: rgba(15, 23, 42, 0.65);
+      --card-border: rgba(255, 255, 255, 0.09);
+      --accent-cyan: #38bdf8;
+      --accent-amber: #fbbf24;
+      --accent-rose: #f43f5e;
+      --accent-green: #34d399;
+      --accent-titanium: #94a3b8;
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-tertiary: #64748b;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 32px 24px;
+      max-width: 1400px;
+      margin-left: auto;
+      margin-right: auto;
+      background-color: var(--bg-black);
+      background-image: 
+        radial-gradient(circle at 50% -10%, #1e293b 0%, transparent 60%),
+        radial-gradient(circle at 10% 40%, rgba(56, 189, 248, 0.05) 0%, transparent 40%);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      min-height: 100vh;
+    }
+
+    /* Apple-style Hero Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      flex-wrap: wrap;
+      gap: 20px;
+      margin-bottom: 28px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .hero-title {
+      margin: 0;
+      font-size: 2.2rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      background: linear-gradient(180deg, #ffffff 0%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-tag {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      font-weight: 400;
+      letter-spacing: -0.01em;
+      margin-top: 4px;
+      display: block;
+    }
+
+    /* Titanium Pill Status Badge */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: rgba(30, 41, 59, 0.5);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 9999px;
+      padding: 8px 18px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: #e2e8f0;
+    }
+
+    .pulse-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background-color: #64748b;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .pulse-dot.connected {
+      background-color: var(--accent-green);
+      box-shadow: 0 0 12px var(--accent-green);
+      animation: applePulse 2.5s infinite;
+    }
+
+    .pulse-dot.recording {
+      background-color: var(--accent-rose);
+      box-shadow: 0 0 12px var(--accent-rose);
+      animation: applePulse 1.2s infinite;
+    }
+
+    @keyframes applePulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.35; transform: scale(1.2); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    /* Browser Warning Banner */
+    .browser-banner {
+      display: none;
+      background: linear-gradient(135deg, rgba(239, 68, 68, 0.15) 0%, rgba(185, 28, 28, 0.1) 100%);
+      border: 1px solid rgba(248, 113, 113, 0.3);
+      border-radius: 16px;
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      font-size: 0.88rem;
+      color: #fca5a5;
+      backdrop-filter: blur(16px);
+    }
+    .browser-banner strong { color: #ffffff; }
+
+    /* Layout Containers */
+    .dashboard-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 18px;
+      margin-bottom: 24px;
+    }
+
+    .glass-card {
+      background: var(--card-bg);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      padding: 18px 22px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+      transition: border-color 0.3s ease;
+    }
+    .glass-card:hover {
+      border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .time-card {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .time-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-tertiary);
+      font-weight: 600;
+    }
+
+    .time-value {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+      color: #38bdf8;
+      margin-top: 4px;
+    }
+
+    .time-offset {
+      font-size: 0.76rem;
+      color: var(--text-secondary);
+      margin-top: 3px;
+    }
+
+    /* Apple-style Pill Controls */
+    .controls-dock {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 0.9) 100%);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 9999px;
+      padding: 10px 18px;
+      color: #f1f5f9;
+      font-weight: 600;
+      font-size: 0.84rem;
+      letter-spacing: -0.01em;
+      cursor: pointer;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      backdrop-filter: blur(12px);
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      border-color: rgba(255, 255, 255, 0.25);
+      background: linear-gradient(180deg, rgba(51, 65, 85, 0.8) 0%, rgba(30, 41, 59, 0.9) 100%);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    }
+
+    button.btn-primary {
+      background: linear-gradient(180deg, #0284c7 0%, #0369a1 100%);
+      border-color: rgba(56, 189, 248, 0.4);
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
+    }
+    button.btn-primary:hover:not(:disabled) {
+      background: linear-gradient(180deg, #0369a1 0%, #075985 100%);
+      box-shadow: 0 6px 20px rgba(2, 132, 199, 0.5);
+    }
+
+    button.btn-record {
+      background: linear-gradient(180deg, #dc2626 0%, #991b1b 100%);
+      border-color: rgba(248, 113, 113, 0.4);
+      color: #ffffff;
+    }
+
+    button:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+      transform: none !important;
+      box-shadow: none !important;
+    }
+
+    /* Grid Sections */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+      gap: 20px;
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    h2 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      margin: 0;
+      color: #e2e8f0;
+    }
+
+    /* Signal Legend Pills */
+    .legend-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 0.78rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .legend-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      font-weight: 500;
+    }
+
+    .dot-x { color: var(--accent-cyan); font-weight: 700; }
+    .dot-y { color: var(--accent-amber); font-weight: 700; }
+    .dot-z { color: var(--accent-rose); font-weight: 700; }
+
+    canvas {
+      width: 100%;
+      height: 185px;
+      background: rgba(7, 13, 23, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px;
+      display: block;
+    }
+
+    /* Environment Pro Grid */
+    .env-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      height: 185px;
+    }
+
+    button.secondary.active {
+      background: linear-gradient(180deg, rgba(16, 185, 129, 0.25) 0%, rgba(5, 150, 105, 0.35) 100%);
+      border-color: rgba(52, 211, 153, 0.6);
+      color: #a7f3d0;
+      box-shadow: 0 0 16px rgba(52, 211, 153, 0.3);
+    }
+
+    .env-tile {
+      background: rgba(7, 13, 23, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      transition: border-color 0.2s;
+    }
+    .env-tile:hover {
+      border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .env-title {
+      font-size: 0.74rem;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+    }
+
+    .env-num {
+      font-size: 1.3rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .val-temp { color: #ff6b6b; }
+    .val-hum { color: #38bdf8; }
+    .val-press { color: #34d399; }
+    .val-gas { color: #fbbf24; }
+
+    .rec-counter {
+      font-size: 0.8rem;
+      color: #f43f5e;
+      font-weight: 600;
+      display: none;
+      align-items: center;
+      gap: 6px;
+    }
   </style>
 </head>
 <body>
-  <header><div><h1>PAL V2 Telemetry</h1><small>USB serial or Bluetooth LE • local CSV export</small></div><span id="status">Not connected</span></header>
-  <div class="controls"><button id="usb">Connect USB</button><button id="ble">Connect Bluetooth LE</button><button id="record">● Start recording</button><button id="stop" class="secondary" disabled>■ Stop recording</button><button id="play" class="secondary" disabled>▶ Play audio</button><button id="clock" class="secondary">Set RTC to current UTC time</button><button id="save" class="secondary">Download CSV</button><button id="clear" class="secondary">Clear data</button></div>
-  <div class="grid">
-    <section><h2>Acceleration (m/s²)</h2><canvas id="accel"></canvas></section>
-    <section><h2>Gyroscope (rad/s)</h2><canvas id="gyro"></canvas></section>
-    <section><h2>Microphone level (dBFS) <small id="audioValue">—</small></h2><canvas id="audio"></canvas></section>
-    <section><h2>Environment</h2><div class="values" id="env"><div class="value"><span class="label">Temperature</span>—</div><div class="value"><span class="label">Humidity</span>—</div><div class="value"><span class="label">Pressure</span>—</div><div class="value"><span class="label">Gas resistance</span>—</div></div></section>
+
+  <header>
+    <div>
+      <h1 class="hero-title">PAL V2 Pro</h1>
+      <span class="hero-tag">ESP32 Feather V2 • Precision Multi-Sensor Telemetry Node</span>
+    </div>
+    <div class="status-badge">
+      <span id="pulseDot" class="pulse-dot"></span>
+      <span id="status">Not connected</span>
+    </div>
+  </header>
+
+  <!-- Browser Compatibility Warning (Shown in Safari / Unsupported browsers) -->
+  <div id="browserBanner" class="browser-banner">
+    <strong>⚠️ Web Serial & Web Bluetooth Browser Notice:</strong> 
+    Your current browser does not support native Web Serial or Web Bluetooth APIs. Please open <strong>http://localhost:8000</strong> using a Chromium-based browser such as <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong>, <strong>Arc</strong>, or <strong>Brave</strong> to connect to your ESP32 board.
   </div>
+
+  <div class="dashboard-bar">
+    <div class="glass-card time-card">
+      <div>
+        <div class="time-label">Device Local Time (DS3231 RTC)</div>
+        <div id="deviceTime" class="time-value">--:--:--</div>
+        <div id="clockDrift" class="time-offset">Clock offset vs PC: --</div>
+      </div>
+      <button id="clock" class="secondary">⚡ Sync RTC to PC</button>
+    </div>
+
+    <div class="glass-card time-card">
+      <div>
+        <div class="time-label">LiPo Battery Health (GPIO35)</div>
+        <div id="batVal" class="time-value" style="color:var(--accent-green);">-- V (--%)</div>
+        <div id="batStatus" class="time-offset">Battery status: Waiting for telemetry…</div>
+      </div>
+    </div>
+
+    <div class="glass-card controls-dock">
+      <button id="usb" class="btn-primary">🔌 Connect USB</button>
+      <button id="ble" class="secondary">📡 Connect BLE</button>
+      <button id="disconnectBtn" class="secondary">🛑 Disconnect</button>
+      <button id="batterySaveBtn" class="secondary">🔋 Battery Save</button>
+      <button id="record" class="btn-record">● Record</button>
+      <button id="stop" class="secondary" disabled>■ Stop</button>
+      <button id="play" class="secondary" disabled>▶ Play Audio</button>
+      <button id="save" class="secondary">💾 Export CSV</button>
+      <button id="clear" class="secondary">🗑️ Clear</button>
+      <div id="recCounter" class="rec-counter">● <span id="recCounterText">0s (0 rows)</span></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <section class="glass-card">
+      <div class="card-header">
+        <h2>Acceleration (m/s²)</h2>
+        <div class="legend-bar">
+          <span class="legend-pill"><span class="dot-x">●</span> X: <span id="valAx">0.00</span></span>
+          <span class="legend-pill"><span class="dot-y">●</span> Y: <span id="valAy">0.00</span></span>
+          <span class="legend-pill"><span class="dot-z">●</span> Z: <span id="valAz">0.00</span></span>
+        </div>
+      </div>
+      <canvas id="accel"></canvas>
+    </section>
+
+    <section class="glass-card">
+      <div class="card-header">
+        <h2>Gyroscope (rad/s)</h2>
+        <div class="legend-bar">
+          <span class="legend-pill"><span class="dot-x">●</span> X: <span id="valGx">0.00</span></span>
+          <span class="legend-pill"><span class="dot-y">●</span> Y: <span id="valGy">0.00</span></span>
+          <span class="legend-pill"><span class="dot-z">●</span> Z: <span id="valGz">0.00</span></span>
+        </div>
+      </div>
+      <canvas id="gyro"></canvas>
+    </section>
+
+    <section class="glass-card">
+      <div class="card-header">
+        <h2>Microphone Level</h2>
+        <div class="legend-bar">
+          <span class="legend-pill" style="color:var(--accent-cyan);">● Sound Level</span>
+          <span id="audioValue" style="color:var(--text-secondary); font-weight:600;">—</span>
+        </div>
+      </div>
+      <canvas id="audio"></canvas>
+    </section>
+
+    <section class="glass-card">
+      <div class="card-header">
+        <h2>Environment (BME688)</h2>
+      </div>
+      <div class="env-grid" id="env">
+        <div class="env-tile">
+          <span class="env-title">🌡️ Temperature</span>
+          <span class="env-num val-temp" id="envTemp">—</span>
+        </div>
+        <div class="env-tile">
+          <span class="env-title">💧 Humidity</span>
+          <span class="env-num val-hum" id="envHum">—</span>
+        </div>
+        <div class="env-tile">
+          <span class="env-title">⏲️ Pressure</span>
+          <span class="env-num val-press" id="envPress">—</span>
+        </div>
+        <div class="env-tile">
+          <span class="env-title">🧪 Gas Resistance</span>
+          <span class="env-num val-gas" id="envGas">—</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
   <script>
-    const SERVICE = '7f510001-5b8d-4a84-9c7c-a07142ab6001', DATA = '7f510002-5b8d-4a84-9c7c-a07142ab6001', COMMAND = '7f510003-5b8d-4a84-9c7c-a07142ab6001';
+    const SERVICE = '7f510001-5b8d-4a84-9c7c-a07142ab6001';
+    const DATA = '7f510002-5b8d-4a84-9c7c-a07142ab6001';
+    const COMMAND = '7f510003-5b8d-4a84-9c7c-a07142ab6001';
+
     const encoder = new TextEncoder(), buffers = { usb: '', ble: '' };
     let serialWriter, commandCharacteristic, bleDevice, activeTransport, rows = [], reconnectTimer;
     let recording = false, audioChunks = [], recordedAudioRate = 8000, playbackSource;
-    const histories = { accel: [], gyro: [], audio: [] }, status = document.querySelector('#status');
-    const setStatus = text => status.textContent = text;
+    let recStartTime = 0;
+
+    const histories = { accel: [], gyro: [], audio: [] };
+    const statusEl = document.querySelector('#status');
+    const pulseDot = document.querySelector('#pulseDot');
+    const browserBanner = document.querySelector('#browserBanner');
+
+    // Check browser compatibility for Web Serial / Web Bluetooth
+    if (!navigator.serial && !navigator.bluetooth) {
+      browserBanner.style.display = 'block';
+    }
+
+    function setStatus(text, state = 'normal') {
+      statusEl.textContent = text;
+      pulseDot.className = 'pulse-dot';
+      if (state === 'connected') pulseDot.classList.add('connected');
+      if (recording) pulseDot.classList.add('recording');
+    }
+
+    function formatTime(ms) {
+      if (!ms || isNaN(ms)) return '--:--:--';
+      const d = new Date(Number(ms));
+      return d.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) +
+             '.' + String(d.getMilliseconds()).padStart(3, '0');
+    }
+
+    function updateClockDisplay(deviceMs) {
+      if (!deviceMs) return;
+      document.querySelector('#deviceTime').textContent = formatTime(deviceMs);
+      const driftMs = Date.now() - Number(deviceMs);
+      const absDrift = Math.abs(driftMs);
+      const sign = driftMs >= 0 ? '+' : '-';
+      const driftText = absDrift < 1000 ? `${sign}${absDrift} ms` : `${sign}${(absDrift / 1000).toFixed(1)} s`;
+      document.querySelector('#clockDrift').textContent = `Clock offset vs PC: ${driftText}`;
+    }
+
+    let statusRestoreTimer = undefined;
+
+    function getActiveStatusSummary() {
+      if (activeTransport === 'usb') return '⚡ Connected via USB Serial (Wired)';
+      if (activeTransport === 'ble') return '📡 Connected via Bluetooth LE (Wireless)';
+      return 'Disconnected • Ready to connect';
+    }
+
+    function showTransientStatus(message, durationMs = 3500) {
+      clearTimeout(statusRestoreTimer);
+      setStatus(message, activeTransport ? 'connected' : 'normal');
+      statusRestoreTimer = setTimeout(() => {
+        setStatus(getActiveStatusSummary(), activeTransport ? 'connected' : 'normal');
+      }, durationMs);
+    }
+
+    function formatStatusMessage(data) {
+      const state = data.state;
+      const detail = data.detail || '';
+      switch (state) {
+        case 'clock_set':
+          return `🕒 RTC updated from dashboard (UTC)`;
+        case 'ble_disconnected':
+          return `📡 Bluetooth connection cleared & advertising restarted`;
+        case 'battery_save_on':
+          return `🔋 Battery save mode ENABLED (LED pulse 5s)`;
+        case 'battery_save_off':
+          return `⚡ Normal power mode (LED continuous status)`;
+        case 'recording':
+          return `🎙️ PCM audio stream started`;
+        case 'recording_stopped':
+          return `⏹️ PCM audio stream stopped`;
+        case 'command_error':
+          return `⚠️ Command error: ${detail}`;
+        case 'sensor_error':
+          return `🚨 Sensor error: ${detail}`;
+        default:
+          return `${state}: ${detail}`;
+      }
+    }
+
     function receive(text, transport) {
       if (transport !== activeTransport) return;
       buffers[transport] += text;
@@ -41,117 +561,365 @@
         try { process(JSON.parse(line)); } catch (_) { setStatus(`Ignored malformed ${transport.toUpperCase()} packet`); }
       }
     }
+
     function process(data) {
-      if (data.type === 'status') { setStatus(data.state + ': ' + data.detail); return; }
-      if (data.type === 'environment') { if (recording) rows.push({ time_ms:data.time_ms, type:'environment', temperature_c:data.temperature_c, humidity_pct:data.humidity_pct, pressure_hpa:data.pressure_hpa, gas_ohms:data.gas_ohms }); showEnv(data); return; }
+      if (data.time_ms) updateClockDisplay(data.time_ms);
+      
+      if (data.type === 'status') {
+        showTransientStatus(formatStatusMessage(data), 3500);
+        return;
+      }
+
+      if (data.type === 'environment') {
+        if (recording) rows.push({ time_ms: data.time_ms, type: 'environment', temperature_c: data.temperature_c, humidity_pct: data.humidity_pct, pressure_hpa: data.pressure_hpa, gas_ohms: data.gas_ohms, battery_v: data.battery_v, battery_pct: data.battery_pct });
+        showEnv(data);
+        return;
+      }
+
       if (data.type !== 'telemetry' || !Array.isArray(data.imu)) return;
-      data.imu.forEach(s => { const time = Number(data.time_ms) + s[0]; if (recording) rows.push({time_ms:time,type:'imu',ax:s[1],ay:s[2],az:s[3],gx:s[4],gy:s[5],gz:s[6]}); histories.accel.push([s[1],s[2],s[3]]); histories.gyro.push([s[4],s[5],s[6]]); });
+
+      let lastSample = null;
+      data.imu.forEach(s => {
+        const time = Number(data.time_ms) + s[0];
+        if (recording) rows.push({ time_ms: time, type: 'imu', ax: s[1], ay: s[2], az: s[3], gx: s[4], gy: s[5], gz: s[6] });
+        histories.accel.push([s[1], s[2], s[3]]);
+        histories.gyro.push([s[4], s[5], s[6]]);
+        lastSample = s;
+      });
+
+      if (lastSample) {
+        document.querySelector('#valAx').textContent = (lastSample[1] >= 0 ? '+' : '') + lastSample[1].toFixed(2);
+        document.querySelector('#valAy').textContent = (lastSample[2] >= 0 ? '+' : '') + lastSample[2].toFixed(2);
+        document.querySelector('#valAz').textContent = (lastSample[3] >= 0 ? '+' : '') + lastSample[3].toFixed(2);
+
+        document.querySelector('#valGx').textContent = (lastSample[4] >= 0 ? '+' : '') + lastSample[4].toFixed(2);
+        document.querySelector('#valGy').textContent = (lastSample[5] >= 0 ? '+' : '') + lastSample[5].toFixed(2);
+        document.querySelector('#valGz').textContent = (lastSample[6] >= 0 ? '+' : '') + lastSample[6].toFixed(2);
+      }
+
       const audioDbfs = Number(data.audio_dbfs);
       if (recording) {
-        rows.push({time_ms:data.audio_time_ms ?? data.time_ms,type:'audio',audio_samples:data.audio_samples,audio_dbfs:audioDbfs});
+        rows.push({ time_ms: data.audio_time_ms ?? data.time_ms, type: 'audio', audio_samples: data.audio_samples, audio_dbfs: audioDbfs });
         if (data.audio_pcm_s8_b64) {
           const binary = atob(data.audio_pcm_s8_b64), chunk = new Int8Array(binary.length);
-          for (let i=0; i<binary.length; i++) chunk[i] = binary.charCodeAt(i);
-          audioChunks.push(chunk); recordedAudioRate = Number(data.audio_rate_hz) || 8000;
+          for (let i = 0; i < binary.length; i++) chunk[i] = binary.charCodeAt(i);
+          audioChunks.push(chunk);
+          recordedAudioRate = Number(data.audio_rate_hz) || 8000;
         }
+        updateRecordingCounter();
       }
+
       histories.audio.push([Number.isFinite(audioDbfs) ? audioDbfs : -120]);
       const audioValue = document.querySelector('#audioValue');
       if (!data.audio_samples) audioValue.textContent = 'no I2S samples';
-      else if (audioDbfs <= -120) audioValue.textContent = '≤ −120 dBFS — check microphone wiring';
+      else if (audioDbfs <= -120) audioValue.textContent = '≤ −120 dBFS';
       else audioValue.textContent = `${audioDbfs.toFixed(1)} dBFS`;
-      for (const key of Object.keys(histories)) { histories[key] = histories[key].slice(-180); draw(key); }
+
+      for (const key of Object.keys(histories)) {
+        histories[key] = histories[key].slice(-180);
+        draw(key);
+      }
     }
-    function showEnv(d) { document.querySelector('#env').innerHTML = `<div class="value"><span class="label">Temperature</span>${d.temperature_c} °C</div><div class="value"><span class="label">Humidity</span>${d.humidity_pct} %</div><div class="value"><span class="label">Pressure</span>${d.pressure_hpa} hPa</div><div class="value"><span class="label">Gas resistance</span>${Number(d.gas_ohms).toLocaleString()} Ω</div>`; }
+
+    function showEnv(d) {
+      document.querySelector('#envTemp').textContent = `${d.temperature_c.toFixed(1)} °C`;
+      document.querySelector('#envHum').textContent = `${d.humidity_pct.toFixed(1)} %`;
+      document.querySelector('#envPress').textContent = `${d.pressure_hpa.toFixed(1)} hPa`;
+      document.querySelector('#envGas').textContent = `${Number(d.gas_ohms).toLocaleString()} Ω`;
+      if (d.battery_v !== undefined) {
+        const v = Number(d.battery_v).toFixed(2);
+        const pct = Number(d.battery_pct);
+        const batEl = document.querySelector('#batVal');
+        const batStat = document.querySelector('#batStatus');
+        batEl.textContent = `${v} V (${pct}%)`;
+        if (pct >= 50) {
+          batEl.style.color = 'var(--accent-green)';
+          batStat.textContent = '🔋 Battery Level Normal';
+        } else if (pct >= 20) {
+          batEl.style.color = 'var(--accent-amber)';
+          batStat.textContent = '🟡 Battery Level Moderate';
+        } else {
+          batEl.style.color = 'var(--accent-rose)';
+          batStat.textContent = '🔴 Battery Low - Recharge Soon';
+        }
+      }
+    }
+
     function draw(key) {
       const canvas = document.querySelector('#' + key), values = histories[key], ctx = canvas.getContext('2d');
       const w = canvas.width = canvas.clientWidth * devicePixelRatio, h = canvas.height = canvas.clientHeight * devicePixelRatio;
-      ctx.clearRect(0,0,w,h); if (!values.length) return;
+      ctx.clearRect(0, 0, w, h);
+      if (!values.length) return;
+
+      // Draw horizontal baseline gridlines
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.lineWidth = 1 * devicePixelRatio;
+      ctx.beginPath();
+      ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2);
+      ctx.moveTo(0, h * 0.25); ctx.lineTo(w, h * 0.25);
+      ctx.moveTo(0, h * 0.75); ctx.lineTo(w, h * 0.75);
+      ctx.stroke();
+
       if (key === 'audio') {
-        ctx.strokeStyle='#36c7ff'; ctx.lineWidth=2*devicePixelRatio; ctx.beginPath();
-        values.forEach((row,i) => { const x=i*w/Math.max(1,values.length-1), db=Math.max(-120,Math.min(0,row[0])), y=(-db/120)*(h-12*devicePixelRatio); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
-        ctx.stroke(); return;
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2 * devicePixelRatio;
+        ctx.beginPath();
+        values.forEach((row, i) => {
+          const x = i * w / Math.max(1, values.length - 1);
+          const db = Math.max(-120, Math.min(0, row[0]));
+          const y = (-db / 120) * (h - 16 * devicePixelRatio) + 8 * devicePixelRatio;
+          i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        });
+        ctx.stroke();
+        return;
       }
-      const max = Math.max(1, ...values.flat().map(Math.abs)), colors = ['#36c7ff','#ffbb44','#ee5d9a'];
-      for (let col=0; col<values[0].length; col++) { ctx.strokeStyle=colors[col]; ctx.lineWidth=2*devicePixelRatio; ctx.beginPath(); values.forEach((row,i) => { const x=i*w/Math.max(1,values.length-1), y=h/2-(row[col]/max)*(h*.44); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });ctx.stroke(); }
+
+      let max = 1;
+      for (let i = 0; i < values.length; i++) {
+        const r = values[i];
+        for (let j = 0; j < r.length; j++) {
+          const abs = Math.abs(r[j]);
+          if (abs > max) max = abs;
+        }
+      }
+
+      const colors = ['#38bdf8', '#fbbf24', '#f43f5e'];
+      for (let col = 0; col < values[0].length; col++) {
+        ctx.strokeStyle = colors[col];
+        ctx.lineWidth = 2 * devicePixelRatio;
+        ctx.beginPath();
+        values.forEach((row, i) => {
+          const x = i * w / Math.max(1, values.length - 1);
+          const y = h / 2 - (row[col] / max) * (h * 0.42);
+          i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        });
+        ctx.stroke();
+      }
     }
+
+    function updateRecordingCounter() {
+      if (!recording) return;
+      const elapsedSec = Math.floor((Date.now() - recStartTime) / 1000);
+      document.querySelector('#recCounterText').textContent = `${elapsedSec}s (${rows.length.toLocaleString()} rows)`;
+    }
+
+    async function disconnectActiveTransport() {
+      clearTimeout(reconnectTimer);
+      if (activeTransport === 'usb') {
+        activeTransport = undefined;
+        if (serialReader) {
+          try { await serialReader.cancel(); } catch (_) {}
+          serialReader = undefined;
+        }
+        if (serialWriter) {
+          try { await serialWriter.releaseLock(); } catch (_) {}
+          serialWriter = undefined;
+        }
+        if (serialPort) {
+          try { await serialPort.close(); } catch (_) {}
+          serialPort = undefined;
+        }
+      } else if (activeTransport === 'ble') {
+        activeTransport = undefined;
+        if (commandCharacteristic) {
+          try { await sendCommand({ cmd: 'disconnect_ble' }); } catch (_) {}
+          commandCharacteristic = undefined;
+        }
+        if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
+          try { bleDevice.gatt.disconnect(); } catch (_) {}
+        }
+      }
+      showTransientStatus('🛑 Safe disconnection complete • Device advertising', 3500);
+      document.querySelector('#record').disabled = false;
+      document.querySelector('#stop').disabled = true;
+      document.querySelector('#play').disabled = !audioChunks.length;
+    }
+
     async function readUsb(port) {
-      const reader = port.readable.getReader(), decoder = new TextDecoder();
+      serialReader = port.readable.getReader();
+      const decoder = new TextDecoder();
       try {
-        while (true) { const {value,done}=await reader.read(); if(done) break; receive(decoder.decode(value,{stream:true}),'usb'); }
+        while (true) {
+          const { value, done } = await serialReader.read();
+          if (done) break;
+          receive(decoder.decode(value, { stream: true }), 'usb');
+        }
       } catch (error) {
-        if (activeTransport === 'usb') setStatus('USB disconnected: '+error.message);
+        if (activeTransport === 'usb') setStatus('USB disconnected: ' + error.message, 'normal');
       } finally {
-        reader.releaseLock();
-        if (activeTransport === 'usb') { activeTransport=undefined; serialWriter=undefined; }
+        if (serialReader) {
+          try { serialReader.releaseLock(); } catch (_) {}
+          serialReader = undefined;
+        }
+        if (activeTransport === 'usb') { activeTransport = undefined; serialWriter = undefined; serialPort = undefined; }
       }
     }
+
     async function connectUsb() {
-      if (!navigator.serial) { setStatus('Web Serial requires Chromium on localhost or HTTPS'); return; }
+      if (!navigator.serial) {
+        browserBanner.style.display = 'block';
+        setStatus('Web Serial is not supported in this browser. Please use Google Chrome or Microsoft Edge.');
+        return;
+      }
       try {
-        const port=await navigator.serial.requestPort(); await port.open({baudRate:115200});
-        serialWriter=port.writable.getWriter(); activeTransport='usb'; buffers.usb=''; setStatus('USB connected');
+        await disconnectActiveTransport();
+        const port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        serialPort = port;
+        serialWriter = port.writable.getWriter();
+        activeTransport = 'usb';
+        buffers.usb = '';
+        showTransientStatus('⚡ Connected via USB Serial (Wired)', 3500);
         readUsb(port);
-      } catch(e) { setStatus('USB: '+e.message); }
+      } catch (e) { setStatus('USB: ' + e.message); }
     }
+
     async function openBleConnection(device) {
-      const server=await device.gatt.connect(), service=await server.getPrimaryService(SERVICE);
-      const data=await service.getCharacteristic(DATA); commandCharacteristic=await service.getCharacteristic(COMMAND);
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE);
+      const data = await service.getCharacteristic(DATA);
+      commandCharacteristic = await service.getCharacteristic(COMMAND);
       await data.startNotifications();
-      data.addEventListener('characteristicvaluechanged', e=>receive(new TextDecoder().decode(e.target.value),'ble'));
-      activeTransport='ble'; buffers.ble=''; setStatus('Bluetooth LE connected');
+      data.addEventListener('characteristicvaluechanged', e => receive(new TextDecoder().decode(e.target.value), 'ble'));
+      activeTransport = 'ble';
+      buffers.ble = '';
+      showTransientStatus('📡 Connected via Bluetooth LE (Wireless)', 3500);
     }
+
     function handleBleDisconnect() {
-      commandCharacteristic=undefined;
+      commandCharacteristic = undefined;
       if (activeTransport !== 'ble') return;
-      setStatus('Bluetooth disconnected; reconnecting…');
-      let attempts=0;
-      const retry=async()=>{ try { await openBleConnection(bleDevice); } catch (_) { if (++attempts<5) reconnectTimer=setTimeout(retry,Math.min(8000,500*2**attempts)); else { activeTransport=undefined; setStatus('Bluetooth reconnect failed; click Connect Bluetooth LE'); } } };
-      reconnectTimer=setTimeout(retry,500);
+      setStatus('Bluetooth disconnected; reconnecting…', 'normal');
+      let attempts = 0;
+      const retry = async () => {
+        try { await openBleConnection(bleDevice); }
+        catch (_) {
+          if (++attempts < 5) reconnectTimer = setTimeout(retry, Math.min(8000, 500 * 2 ** attempts));
+          else { activeTransport = undefined; setStatus('Bluetooth reconnect failed', 'normal'); }
+        }
+      };
+      reconnectTimer = setTimeout(retry, 500);
     }
+
     async function connectBle() {
-      if (!navigator.bluetooth) { setStatus('Web Bluetooth requires Chromium on localhost or HTTPS'); return; }
+      if (!navigator.bluetooth) {
+        browserBanner.style.display = 'block';
+        setStatus('Web Bluetooth is not supported in this browser. Please use Google Chrome or Microsoft Edge.');
+        return;
+      }
       try {
-        clearTimeout(reconnectTimer);
-        bleDevice=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
-        bleDevice.removeEventListener('gattserverdisconnected',handleBleDisconnect);
-        bleDevice.addEventListener('gattserverdisconnected',handleBleDisconnect);
+        await disconnectActiveTransport();
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [
+            { services: [SERVICE] },
+            { name: 'PAL-V2-Telemetry' },
+            { namePrefix: 'PAL' }
+          ],
+          optionalServices: [SERVICE]
+        });
+        bleDevice.removeEventListener('gattserverdisconnected', handleBleDisconnect);
+        bleDevice.addEventListener('gattserverdisconnected', handleBleDisconnect);
         await openBleConnection(bleDevice);
-      } catch(e) { setStatus('Bluetooth: '+e.message); }
+      } catch (e) { setStatus('Bluetooth: ' + e.message); }
     }
+
     async function sendCommand(command) {
-      const value=encoder.encode(JSON.stringify(command)+'\n');
-      if(activeTransport==='usb' && serialWriter) { await serialWriter.write(value); return; }
-      if(activeTransport==='ble' && commandCharacteristic) { await commandCharacteristic.writeValueWithResponse(value); return; }
+      const value = encoder.encode(JSON.stringify(command) + '\n');
+      if (activeTransport === 'usb' && serialWriter) { await serialWriter.write(value); return; }
+      if (activeTransport === 'ble' && commandCharacteristic) { await commandCharacteristic.writeValueWithResponse(value); return; }
       throw new Error('Connect USB or Bluetooth first');
     }
+
     async function startRecording() {
       if (!activeTransport) { setStatus('Connect USB or Bluetooth before recording'); return; }
       try {
-        await sendCommand({cmd:'start_audio'}); rows=[]; audioChunks=[]; recording=true;
-        document.querySelector('#record').disabled=true; document.querySelector('#stop').disabled=false; document.querySelector('#play').disabled=true;
-        setStatus('Recording sensor data and audio…');
-      } catch (error) { setStatus('Could not start recording: '+error.message); }
+        await sendCommand({ cmd: 'start_audio' });
+        rows = []; audioChunks = []; recording = true; recStartTime = Date.now();
+        document.querySelector('#record').disabled = true;
+        document.querySelector('#stop').disabled = false;
+        document.querySelector('#play').disabled = true;
+        document.querySelector('#recCounter').style.display = 'inline-flex';
+        setStatus('Recording sensor telemetry and PCM audio…', 'connected');
+      } catch (error) { setStatus('Could not start recording: ' + error.message); }
     }
+
     async function stopRecording() {
-      try { await sendCommand({cmd:'stop_audio'}); } catch (error) { setStatus('Audio stop command failed: '+error.message); }
-      recording=false; document.querySelector('#record').disabled=false; document.querySelector('#stop').disabled=true; document.querySelector('#play').disabled=!audioChunks.length;
-      const samples=audioChunks.reduce((total,chunk)=>total+chunk.length,0);
-      setStatus(`Recording stopped: ${rows.length.toLocaleString()} rows, ${(samples/recordedAudioRate).toFixed(1)} s audio`);
+      try { await sendCommand({ cmd: 'stop_audio' }); } catch (error) { setStatus('Audio stop command failed: ' + error.message); }
+      recording = false;
+      document.querySelector('#record').disabled = false;
+      document.querySelector('#stop').disabled = true;
+      document.querySelector('#play').disabled = !audioChunks.length;
+      document.querySelector('#recCounter').style.display = 'none';
+      const samples = audioChunks.reduce((total, chunk) => total + chunk.length, 0);
+      setStatus(`Recording stopped: ${rows.length.toLocaleString()} rows, ${(samples / recordedAudioRate).toFixed(1)} s audio`, 'connected');
     }
+
     async function playAudio() {
       if (!audioChunks.length) { setStatus('No recorded audio to play'); return; }
       if (playbackSource) { try { playbackSource.stop(); } catch (_) {} }
-      const context=new AudioContext(), total=audioChunks.reduce((sum,chunk)=>sum+chunk.length,0), audioBuffer=context.createBuffer(1,total,recordedAudioRate), channel=audioBuffer.getChannelData(0);
-      let offset=0; for (const chunk of audioChunks) { for (let i=0;i<chunk.length;i++) channel[offset++]=chunk[i]/128; }
-      playbackSource=context.createBufferSource(); playbackSource.buffer=audioBuffer; playbackSource.connect(context.destination); playbackSource.start(); setStatus(`Playing ${(total/recordedAudioRate).toFixed(1)} s recorded audio`);
-      playbackSource.onended=()=>{ playbackSource=undefined; setStatus('Audio playback complete'); context.close(); };
+      const context = new AudioContext();
+      const total = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const audioBuffer = context.createBuffer(1, total, recordedAudioRate);
+      const channel = audioBuffer.getChannelData(0);
+      let offset = 0;
+      for (const chunk of audioChunks) {
+        for (let i = 0; i < chunk.length; i++) channel[offset++] = chunk[i] / 128;
+      }
+      playbackSource = context.createBufferSource();
+      playbackSource.buffer = audioBuffer;
+      playbackSource.connect(context.destination);
+      playbackSource.start();
+      setStatus(`Playing ${(total / recordedAudioRate).toFixed(1)} s recorded audio`, 'connected');
+      playbackSource.onended = () => { playbackSource = undefined; setStatus('Audio playback complete', 'connected'); context.close(); };
     }
-    document.querySelector('#usb').onclick=connectUsb; document.querySelector('#ble').onclick=connectBle;
-    document.querySelector('#record').onclick=startRecording; document.querySelector('#stop').onclick=stopRecording; document.querySelector('#play').onclick=playAudio;
-    document.querySelector('#clock').onclick=async()=>{ try { await sendCommand({cmd:'set_time',unix_ms:Date.now()}); setStatus('Clock update sent'); } catch(e) { setStatus(e.message); } };
-    document.querySelector('#clear').onclick=()=>{ recording=false; rows=[]; audioChunks=[]; document.querySelector('#record').disabled=false; document.querySelector('#stop').disabled=true; document.querySelector('#play').disabled=true; for(const k in histories) histories[k]=[]; document.querySelectorAll('canvas').forEach(c=>c.getContext('2d').clearRect(0,0,c.width,c.height)); setStatus('Recorded data cleared'); };
-    document.querySelector('#save').onclick=()=>{ if(!rows.length){setStatus('No recorded data to export');return;} const csvRows=rows.map(({time_ms,...values})=>({date_time:new Date(Number(time_ms)).toISOString(),...values})), keys=[...new Set(csvRows.flatMap(Object.keys))], escape=value=>`"${String(value??'').replaceAll('"','""')}"`, csv=[keys.join(','),...csvRows.map(r=>keys.map(k=>escape(r[k])).join(','))].join('\n'); const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'})), a=Object.assign(document.createElement('a'),{href:url,download:`pal-v2-${new Date().toISOString().replace(/[:.]/g,'-')}.csv`});a.click();setTimeout(()=>URL.revokeObjectURL(url),1000); };
+
+    document.querySelector('#usb').onclick = connectUsb;
+    document.querySelector('#ble').onclick = connectBle;
+    document.querySelector('#disconnectBtn').onclick = disconnectActiveTransport;
+    document.querySelector('#record').onclick = startRecording;
+    document.querySelector('#stop').onclick = stopRecording;
+    document.querySelector('#play').onclick = playAudio;
+
+    let batterySaveActive = false;
+    document.querySelector('#batterySaveBtn').onclick = async () => {
+      try {
+        await sendCommand({ cmd: 'toggle_battery_save' });
+        batterySaveActive = !batterySaveActive;
+        document.querySelector('#batterySaveBtn').classList.toggle('active', batterySaveActive);
+        showTransientStatus(batterySaveActive ? '🔋 Battery save mode ENABLED (LED pulse 5s)' : '⚡ Normal power mode (LED continuous status)', 3500);
+      } catch (e) { showTransientStatus('⚠️ Battery save error: ' + e.message, 4000); }
+    };
+
+    document.querySelector('#clock').onclick = async () => {
+      try {
+        await sendCommand({ cmd: 'set_time', unix_ms: Date.now() });
+        showTransientStatus('🕒 RTC updated from dashboard (UTC)', 3500);
+      } catch (e) { showTransientStatus('⚠️ Sync error: ' + e.message, 4000); }
+    };
+
+    document.querySelector('#clear').onclick = () => {
+      recording = false; rows = []; audioChunks = [];
+      document.querySelector('#record').disabled = false;
+      document.querySelector('#stop').disabled = true;
+      document.querySelector('#play').disabled = true;
+      document.querySelector('#recCounter').style.display = 'none';
+      for (const k in histories) histories[k] = [];
+      document.querySelectorAll('canvas').forEach(c => c.getContext('2d').clearRect(0, 0, c.width, c.height));
+      setStatus('Recorded data cleared');
+    };
+
+    document.querySelector('#save').onclick = () => {
+      if (!rows.length) { setStatus('No recorded data to export'); return; }
+      const csvRows = rows.map(({ time_ms, ...values }) => ({ date_time: new Date(Number(time_ms)).toISOString(), ...values }));
+      const keys = [...new Set(csvRows.flatMap(Object.keys))];
+      const escape = value => `"${String(value ?? '').replaceAll('"', '""')}"`;
+      const csv = [keys.join(','), ...csvRows.map(r => keys.map(k => escape(r[k])).join(','))].join('\n');
+      const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+      const a = Object.assign(document.createElement('a'), { href: url, download: `pal-v2-pro-${new Date().toISOString().replace(/[:.]/g, '-')}.csv` });
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+
     if (!window.isSecureContext) setStatus('Serve this dashboard from localhost or HTTPS to connect');
   </script>
 </body>

@@ -3,8 +3,9 @@
 #include <RTClib.h>
 #include <Adafruit_BME680.h>
 #include <Adafruit_LSM6DSOX.h>
+#include <Adafruit_NeoPixel.h>
 #include <NimBLEDevice.h>
-#include <driver/i2s_std.h>
+#include <driver/i2s.h>
 #include <freertos/queue.h>
 #include <ctype.h>
 #include <errno.h>
@@ -16,6 +17,9 @@
 constexpr gpio_num_t MIC_BCLK = GPIO_NUM_26;
 constexpr gpio_num_t MIC_DOUT = GPIO_NUM_25;
 constexpr gpio_num_t MIC_LRCL = GPIO_NUM_4;
+constexpr gpio_num_t PIN_BATTERY = GPIO_NUM_35;
+constexpr gpio_num_t STATUS_NEOPIXEL_PIN = GPIO_NUM_0;
+constexpr gpio_num_t STATUS_NEOPIXEL_POWER_PIN = GPIO_NUM_2;
 constexpr uint32_t MIC_SAMPLE_RATE = 16000;
 constexpr uint32_t AUDIO_PLAYBACK_RATE = 8000;
 
@@ -33,8 +37,9 @@ static const char *COMMAND_UUID = "7f510003-5b8d-4a84-9c7c-a07142ab6001";
 RTC_DS3231 rtc;
 Adafruit_BME680 bme;
 Adafruit_LSM6DSOX lsm6dsox;
+Adafruit_NeoPixel pixel(1, STATUS_NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 NimBLECharacteristic *dataCharacteristic = nullptr;
-i2s_chan_handle_t microphoneChannel = nullptr;
+i2s_port_t microphonePort = I2S_NUM_0;
 
 struct ImuSample {
   uint32_t offsetMs;
@@ -57,6 +62,8 @@ uint32_t clockBaseMillis = 0;
 uint32_t lastImuMs = 0;
 uint32_t lastPacketMs = 0;
 uint32_t lastEnvMs = 0;
+uint32_t lastLedUpdateMs = 0;
+uint32_t lastBleActivityMs = 0;
 uint32_t bmeReadyAtMs = 0;
 bool bmeReading = false;
 bool audioStreaming = false;
@@ -71,6 +78,7 @@ struct CommandMessage {
 };
 
 QueueHandle_t commandQueue = nullptr;
+bool batterySaveMode = false;
 
 String encodeBase64(const uint8_t *data, size_t length) {
   static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -89,6 +97,119 @@ String encodeBase64(const uint8_t *data, size_t length) {
   return encoded;
 }
 
+float readBatteryVoltage() {
+  // Adafruit Feather ESP32 V2 uses a 1:2 voltage divider (two 100k resistors) on GPIO35.
+  const uint32_t raw = analogRead(PIN_BATTERY);
+  const float vAdc = (static_cast<float>(raw) / 4095.0f) * 3.3f;
+  const float vBat = vAdc * 2.0f;
+  return vBat;
+}
+
+uint8_t calculateBatteryPercentage(float vBat) {
+  if (vBat >= 4.20f) return 100;
+  if (vBat <= 3.30f) return 0;
+  return static_cast<uint8_t>(constrain((vBat - 3.30f) / (4.20f - 3.30f) * 100.0f, 0.0f, 100.0f));
+}
+
+enum SystemStatusColor {
+  COLOR_BLUE,   // BLE Connected
+  COLOR_RED,    // Sensor Error or High Gas Alert
+  COLOR_AMBER,  // RTC Drift / Low Battery
+  COLOR_GREEN   // All Systems Normal
+};
+
+SystemStatusColor evaluateSystemStatus(bool bleConn, bool rtcOk, bool rtcSyncNeeded, bool imuOk, bool bmeOk, bool micOk, float vBat, uint32_t gasOhms) {
+  if (bleConn) return COLOR_BLUE;
+  if (!rtcOk || !imuOk || !bmeOk || !micOk || (bmeOk && gasOhms > 0 && gasOhms < 20000)) return COLOR_RED;
+  if (rtcSyncNeeded || (vBat > 0.5f && vBat < 3.48f)) return COLOR_AMBER;
+  return COLOR_GREEN;
+}
+
+void performSafeBleDisconnect() {
+  bleSubscribed = false;
+  audioStreaming = false;
+  audioPlaybackCount = 0;
+  const uint16_t handle = bleConnectionHandle;
+  bleConnectionHandle = BLE_HS_CONN_HANDLE_NONE;
+
+  NimBLEServer *server = NimBLEDevice::getServer();
+  if (server != nullptr && handle != BLE_HS_CONN_HANDLE_NONE && server->getConnectedCount() > 0) {
+    server->disconnect(handle);
+  }
+
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  if (adv != nullptr && !adv->isAdvertising()) {
+    adv->start();
+  }
+}
+
+void checkBleSafetyTimeout() {
+  NimBLEServer *server = NimBLEDevice::getServer();
+  if (server == nullptr) return;
+  const size_t connCount = server->getConnectedCount();
+
+  if (connCount == 0) {
+    if (bleSubscribed || bleConnectionHandle != BLE_HS_CONN_HANDLE_NONE) {
+      performSafeBleDisconnect();
+    }
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    if (adv != nullptr && !adv->isAdvertising()) {
+      adv->start();
+    }
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (lastBleActivityMs > 0 && (now - lastBleActivityMs > 15000)) {
+    performSafeBleDisconnect();
+  }
+}
+
+void updateNeoPixelStatus() {
+  checkBleSafetyTimeout();
+  NimBLEServer *server = NimBLEDevice::getServer();
+  const bool activeBleConnected = bleSubscribed && (server != nullptr && server->getConnectedCount() > 0);
+  const float vBat = readBatteryVoltage();
+  const SystemStatusColor status = evaluateSystemStatus(
+    activeBleConnected, rtcReady, rtcNeedsSync, imuReady, bmeReady, micReady, vBat, bme.gas_resistance
+  );
+
+  uint8_t r = 0, g = 0, b = 0;
+  switch (status) {
+    case COLOR_BLUE:
+      b = 255;
+      break;
+    case COLOR_RED:
+      r = 255;
+      break;
+    case COLOR_AMBER:
+      r = 255; g = 140;
+      break;
+    case COLOR_GREEN:
+    default:
+      g = 255;
+      break;
+  }
+
+  if (batterySaveMode) {
+    const uint32_t phase = millis() % 5000;
+    constexpr uint32_t PULSE_DURATION_MS = 600;
+    if (phase < PULSE_DURATION_MS) {
+      const float factor = sinf((static_cast<float>(phase) / static_cast<float>(PULSE_DURATION_MS)) * M_PI);
+      pixel.setPixelColor(0, pixel.Color(
+        static_cast<uint8_t>(r * factor),
+        static_cast<uint8_t>(g * factor),
+        static_cast<uint8_t>(b * factor)
+      ));
+    } else {
+      pixel.setPixelColor(0, pixel.Color(0, 0, 0));
+    }
+  } else {
+    pixel.setPixelColor(0, pixel.Color(r, g, b));
+  }
+  pixel.show();
+}
+
 uint64_t nowUnixMs() {
   return clockBaseMs + static_cast<uint32_t>(millis() - clockBaseMillis);
 }
@@ -105,16 +226,32 @@ void sendLine(const String &line) {
     return;
   }
 
-  // JSON lines are split only at the BLE transport boundary. The dashboard
-  // reassembles them by their trailing newline, so larger IMU packets are safe.
   const size_t chunkBytes = bleChunkBytes;
   const uint16_t connectionHandle = bleConnectionHandle;
+  bool notifySuccess = true;
+
   for (size_t start = 0; start < line.length(); start += chunkBytes) {
     const size_t length = min(chunkBytes, line.length() - start);
-    dataCharacteristic->notify(reinterpret_cast<const uint8_t *>(line.c_str() + start), length, connectionHandle);
+    if (dataCharacteristic->notify(reinterpret_cast<const uint8_t *>(line.c_str() + start), length, connectionHandle)) {
+      lastBleActivityMs = millis();
+    } else {
+      notifySuccess = false;
+      break;
+    }
   }
-  const uint8_t newline = '\n';
-  dataCharacteristic->notify(&newline, 1, connectionHandle);
+
+  if (notifySuccess) {
+    const uint8_t newline = '\n';
+    if (dataCharacteristic->notify(&newline, 1, connectionHandle)) {
+      lastBleActivityMs = millis();
+    } else {
+      notifySuccess = false;
+    }
+  }
+
+  if (!notifySuccess) {
+    performSafeBleDisconnect();
+  }
 }
 
 void sendStatus(const char *state, const char *detail) {
@@ -137,19 +274,34 @@ void setRtcFromUnixMs(uint64_t unixMs) {
 
 void handleCommand(String command) {
   command.trim();
-  if (command.indexOf("\"cmd\":\"start_audio\"") >= 0) {
+  if (command.indexOf("toggle_battery_save") >= 0 || command.indexOf("battery_save") >= 0) {
+    batterySaveMode = !batterySaveMode;
+    if (batterySaveMode) {
+      sendStatus("battery_save_on", "Battery save mode ENABLED (LED pulsating every 5s)");
+    } else {
+      sendStatus("battery_save_off", "Battery save mode DISABLED (LED continuous status)");
+    }
+    updateNeoPixelStatus();
+    return;
+  }
+  if (command.indexOf("disconnect_ble") >= 0) {
+    performSafeBleDisconnect();
+    sendStatus("ble_disconnected", "Bluetooth connection cleared & advertising restarted");
+    return;
+  }
+  if (command.indexOf("start_audio") >= 0) {
     audioStreaming = true;
     audioPlaybackCount = 0;
     sendStatus("recording", "PCM audio stream started");
     return;
   }
-  if (command.indexOf("\"cmd\":\"stop_audio\"") >= 0) {
+  if (command.indexOf("stop_audio") >= 0) {
     audioStreaming = false;
     audioPlaybackCount = 0;
     sendStatus("recording_stopped", "PCM audio stream stopped");
     return;
   }
-  if (command.indexOf("\"cmd\":\"set_time\"") < 0) {
+  if (command.indexOf("set_time") < 0) {
     sendStatus("command_error", "Unknown command");
     return;
   }
@@ -175,6 +327,7 @@ void handleCommand(String command) {
 
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo & /*connInfo*/) override {
+    lastBleActivityMs = millis();
     if (commandQueue == nullptr) return;
     const NimBLEAttValue value = characteristic->getValue();
     CommandMessage message = {};
@@ -189,6 +342,7 @@ class CommandCallbacks : public NimBLECharacteristicCallbacks {
 
 class DataCallbacks : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic * /*characteristic*/, NimBLEConnInfo &connInfo, uint16_t subValue) override {
+    lastBleActivityMs = millis();
     bleSubscribed = subValue != 0;
     if (bleSubscribed) {
       bleConnectionHandle = connInfo.getConnHandle();
@@ -198,10 +352,12 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer * /*server*/, NimBLEConnInfo &connInfo) override {
+    lastBleActivityMs = millis();
+    bleConnectionHandle = connInfo.getConnHandle();
+  }
   void onDisconnect(NimBLEServer * /*server*/, NimBLEConnInfo & /*connInfo*/, int /*reason*/) override {
-    bleSubscribed = false;
-    bleChunkBytes = 20;
-    bleConnectionHandle = BLE_HS_CONN_HANDLE_NONE;
+    performSafeBleDisconnect();
   }
 };
 
@@ -217,37 +373,44 @@ void beginBle() {
   server->advertiseOnDisconnect(true);
   NimBLEService *service = server->createService(SERVICE_UUID);
   dataCharacteristic = service->createCharacteristic(DATA_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-  NimBLECharacteristic *commandCharacteristic = service->createCharacteristic(COMMAND_UUID, NIMBLE_PROPERTY::WRITE);
+  NimBLECharacteristic *commandCharacteristic = service->createCharacteristic(
+    COMMAND_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
   dataCharacteristic->setCallbacks(&dataCallbacks);
   commandCharacteristic->setCallbacks(&commandCallbacks);
   dataCharacteristic->setValue("PAL V2 ready");
+  server->start();
+
   NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
   advertising->addServiceUUID(SERVICE_UUID);
   advertising->setName(DEVICE_NAME);
+  advertising->enableScanResponse(true);
   advertising->start();
 }
 
 void beginMicrophone() {
-  i2s_chan_config_t channelConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  channelConfig.dma_desc_num = 8;
-  channelConfig.dma_frame_num = 128;
-  if (i2s_new_channel(&channelConfig, nullptr, &microphoneChannel) != ESP_OK) return;
+  i2s_config_t config = {};
+  config.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
+  config.sample_rate = MIC_SAMPLE_RATE;
+  config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  config.communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_STAND_I2S);
+  config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  config.dma_buf_count = 8;
+  config.dma_buf_len = 128;
+  config.use_apll = false;
 
-  i2s_std_config_t standardConfig = {};
-  standardConfig.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE);
-  standardConfig.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
-  standardConfig.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
-  standardConfig.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-  standardConfig.gpio_cfg.bclk = MIC_BCLK;
-  standardConfig.gpio_cfg.ws = MIC_LRCL;
-  standardConfig.gpio_cfg.dout = I2S_GPIO_UNUSED;
-  standardConfig.gpio_cfg.din = MIC_DOUT;
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num = MIC_BCLK;
+  pins.ws_io_num = MIC_LRCL;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;
+  pins.data_in_num = MIC_DOUT;
 
-  micReady = i2s_channel_init_std_mode(microphoneChannel, &standardConfig) == ESP_OK &&
-             i2s_channel_enable(microphoneChannel) == ESP_OK;
+  micReady = i2s_driver_install(microphonePort, &config, 0, nullptr) == ESP_OK &&
+             i2s_set_pin(microphonePort, &pins) == ESP_OK &&
+             i2s_start(microphonePort) == ESP_OK;
   if (!micReady) {
-    i2s_del_channel(microphoneChannel);
-    microphoneChannel = nullptr;
+    i2s_driver_uninstall(microphonePort);
   }
 }
 
@@ -255,7 +418,7 @@ void readMicrophone() {
   if (!micReady) return;
   int32_t frames[128];
   size_t bytesRead = 0;
-  if (i2s_channel_read(microphoneChannel, frames, sizeof(frames), &bytesRead, 0) != ESP_OK) return;
+  if (i2s_read(microphonePort, frames, sizeof(frames), &bytesRead, 0) != ESP_OK) return;
   const size_t words = bytesRead / sizeof(int32_t);
   for (size_t i = 0; i + 1 < words; i += 2) {
     // Accumulate normalized PCM energy for a 100 ms RMS dBFS reading.
@@ -270,7 +433,7 @@ void readMicrophone() {
     if (audioStreaming && keepPlaybackSample && audioPlaybackCount < AUDIO_PLAYBACK_BUFFER_SIZE) {
       // Downsample to 8 kHz and quantize the left-justified microphone PCM to
       // signed 8-bit audio for bandwidth-efficient browser playback.
-      audioPlaybackSamples[audioPlaybackCount++] = static_cast<int8_t>(constrain(raw >> 16, -128, 127));
+      audioPlaybackSamples[audioPlaybackCount++] = static_cast<int8_t>(constrain(raw >> 24, -128, 127));
     }
   }
 }
@@ -330,11 +493,15 @@ void sendEnvironment() {
     sendStatus("sensor_error", "BME688 read failed");
     return;
   }
+  const float vBat = readBatteryVoltage();
+  const uint8_t pctBat = calculateBatteryPercentage(vBat);
   String packet = "{\"type\":\"environment\",\"time_ms\":" + String(nowUnixMs()) +
                   ",\"temperature_c\":" + String(bme.temperature, 2) +
                   ",\"humidity_pct\":" + String(bme.humidity, 2) +
                   ",\"pressure_hpa\":" + String(bme.pressure / 100.0F, 2) +
-                  ",\"gas_ohms\":" + String(bme.gas_resistance) + "}";
+                  ",\"gas_ohms\":" + String(bme.gas_resistance) +
+                  ",\"battery_v\":" + String(vBat, 2) +
+                  ",\"battery_pct\":" + String(pctBat) + "}";
   sendLine(packet);
 }
 
@@ -385,6 +552,30 @@ void readBleCommands() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  pinMode(STATUS_NEOPIXEL_POWER_PIN, OUTPUT);
+  digitalWrite(STATUS_NEOPIXEL_POWER_PIN, HIGH);
+  pixel.begin();
+  pixel.setBrightness(20);
+
+  // Onboard NeoPixel RGB Boot Self-Test (Red -> Green -> Blue -> Yellow -> Cyan -> Magenta -> White -> Off)
+  const uint32_t bootColors[] = {
+    pixel.Color(255, 0, 0),     // Red
+    pixel.Color(0, 255, 0),     // Green
+    pixel.Color(0, 0, 255),     // Blue
+    pixel.Color(255, 255, 0),   // Yellow
+    pixel.Color(0, 255, 255),   // Cyan
+    pixel.Color(255, 0, 255),   // Magenta
+    pixel.Color(255, 255, 255), // White
+    pixel.Color(0, 0, 0)        // Off
+  };
+  for (size_t i = 0; i < sizeof(bootColors) / sizeof(bootColors[0]); ++i) {
+    pixel.setPixelColor(0, bootColors[i]);
+    pixel.show();
+    delay(150);
+  }
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   Wire.begin(); // STEMMA QT uses SDA=GPIO22 and SCL=GPIO20 on this Feather.
   commandQueue = xQueueCreate(4, sizeof(CommandMessage));
 
@@ -449,5 +640,9 @@ void loop() {
   if (now - lastEnvMs >= ENV_INTERVAL_MS) {
     lastEnvMs = now;
     startEnvironmentReading();
+  }
+  if (now - lastLedUpdateMs >= 250) {
+    lastLedUpdateMs = now;
+    updateNeoPixelStatus();
   }
 }
