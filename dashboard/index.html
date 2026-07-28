@@ -383,8 +383,10 @@
     </div>
 
     <div class="glass-card time-card">
-      <div>
-        <div class="time-label">LiPo Battery Health (GPIO35)</div>
+      <div style="width:100%;">
+        <div class="time-label" style="display:flex; justify-content:space-between; align-items:center; width:100%;">
+          <span>LiPo Battery Health (GPIO35)</span>
+        </div>
         <div id="batVal" class="time-value" style="color:var(--accent-green);">-- V (--%)</div>
         <div id="batStatus" class="time-offset">Battery status: Waiting for telemetry…</div>
       </div>
@@ -394,7 +396,6 @@
       <button id="usb" class="btn-primary">🔌 Connect USB</button>
       <button id="ble" class="secondary">📡 Connect BLE</button>
       <button id="disconnectBtn" class="secondary">🛑 Disconnect</button>
-      <button id="batterySaveBtn" class="secondary">🔋 Battery Save</button>
       <button id="record" class="btn-record">● Record</button>
       <button id="stop" class="secondary" disabled>■ Stop</button>
       <button id="play" class="secondary" disabled>▶ Play Audio</button>
@@ -463,9 +464,97 @@
         </div>
       </div>
     </section>
+
+    <section class="glass-card">
+      <div class="card-header">
+        <h2>Indoor Air Quality (IAQ)</h2>
+        <div id="iaqBadge" class="legend-pill" style="font-size:0.82rem; padding:4px 10px;">🟢 Good (0-50)</div>
+      </div>
+      <div class="env-grid" id="iaqGrid">
+        <div class="env-tile">
+          <span class="env-title">🍃 IAQ Index</span>
+          <span class="env-num" id="iaqVal" style="color:var(--accent-green);">—</span>
+        </div>
+        <div class="env-tile">
+          <span class="env-title">🧪 VOC Equivalent</span>
+          <span class="env-num" id="vocVal" style="color:var(--accent-cyan);">— ppm</span>
+        </div>
+        <div class="env-tile">
+          <span class="env-title">💨 eCO₂ Equivalent</span>
+          <span class="env-num" id="eco2Val" style="color:var(--accent-amber);">— ppm</span>
+        </div>
+        <div class="env-tile">
+          <span class="env-title">⚡ Air Status</span>
+          <span class="env-num" id="iaqStatusText" style="font-size:1.0rem; color:var(--text-primary);">Waiting…</span>
+        </div>
+      </div>
+    </section>
   </div>
 
   <script>
+    class ImaAdpcmDecoder {
+      static STEP_TABLE = [
+        7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+        19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+        50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+        130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+        337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+        876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+        2272, 2499, 2749, 3024, 3326, 3659, 4025, 4428, 4870, 5357,
+        5893, 6482, 7130, 7843, 8627, 9490, 10439, 11483, 12631, 13895,
+        15285, 16814, 18495, 20345, 22380, 24618, 27079, 29787, 32767
+      ];
+
+      static INDEX_TABLE = [
+        -1, -1, -1, -1, 2, 4, 6, 8,
+        -1, -1, -1, -1, 2, 4, 6, 8
+      ];
+
+      constructor() {
+        this.reset();
+      }
+
+      reset() {
+        this.predictedSample = 0;
+        this.stepIndex = 0;
+      }
+
+      decodeNibble(nibble) {
+        const step = ImaAdpcmDecoder.STEP_TABLE[this.stepIndex];
+        let delta = step >> 3;
+        if (nibble & 4) delta += step;
+        if (nibble & 2) delta += (step >> 1);
+        if (nibble & 1) delta += (step >> 2);
+
+        if (nibble & 8) {
+          this.predictedSample -= delta;
+        } else {
+          this.predictedSample += delta;
+        }
+
+        if (this.predictedSample > 32767) this.predictedSample = 32767;
+        if (this.predictedSample < -32768) this.predictedSample = -32768;
+
+        this.stepIndex += ImaAdpcmDecoder.INDEX_TABLE[nibble & 0x0F];
+        if (this.stepIndex < 0) this.stepIndex = 0;
+        if (this.stepIndex > 88) this.stepIndex = 88;
+
+        return this.predictedSample;
+      }
+
+      decodeBlock(adpcmBytes) {
+        const pcmSamples = new Int16Array(adpcmBytes.length * 2);
+        let outIdx = 0;
+        for (let i = 0; i < adpcmBytes.length; i++) {
+          const byte = adpcmBytes[i];
+          pcmSamples[outIdx++] = this.decodeNibble(byte & 0x0F);
+          pcmSamples[outIdx++] = this.decodeNibble((byte >> 4) & 0x0F);
+        }
+        return pcmSamples;
+      }
+    }
+
+    const adpcmDecoder = new ImaAdpcmDecoder();
     const SERVICE = '7f510001-5b8d-4a84-9c7c-a07142ab6001';
     const DATA = '7f510002-5b8d-4a84-9c7c-a07142ab6001';
     const COMMAND = '7f510003-5b8d-4a84-9c7c-a07142ab6001';
@@ -533,10 +622,7 @@
           return `🕒 RTC updated from dashboard (UTC)`;
         case 'ble_disconnected':
           return `📡 Bluetooth connection cleared & advertising restarted`;
-        case 'battery_save_on':
-          return `🔋 Battery save mode ENABLED (LED pulse 5s)`;
-        case 'battery_save_off':
-          return `⚡ Normal power mode (LED continuous status)`;
+
         case 'recording':
           return `🎙️ PCM audio stream started`;
         case 'recording_stopped':
@@ -571,7 +657,7 @@
       }
 
       if (data.type === 'environment') {
-        if (recording) rows.push({ time_ms: data.time_ms, type: 'environment', temperature_c: data.temperature_c, humidity_pct: data.humidity_pct, pressure_hpa: data.pressure_hpa, gas_ohms: data.gas_ohms, battery_v: data.battery_v, battery_pct: data.battery_pct });
+        if (recording) rows.push({ time_ms: data.time_ms, type: 'environment', temperature_c: data.temperature_c, humidity_pct: data.humidity_pct, pressure_hpa: data.pressure_hpa, gas_ohms: data.gas_ohms, iaq: data.iaq, voc_ppm: data.voc_ppm, eco2_ppm: data.eco2_ppm, battery_v: data.battery_v, battery_pct: data.battery_pct });
         showEnv(data);
         return;
       }
@@ -600,9 +686,24 @@
       const audioDbfs = Number(data.audio_dbfs);
       if (recording) {
         rows.push({ time_ms: data.audio_time_ms ?? data.time_ms, type: 'audio', audio_samples: data.audio_samples, audio_dbfs: audioDbfs });
-        if (data.audio_pcm_s8_b64) {
-          const binary = atob(data.audio_pcm_s8_b64), chunk = new Int8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) chunk[i] = binary.charCodeAt(i);
+        if (data.audio_pcm_s16_b64) {
+          const binary = atob(data.audio_pcm_s16_b64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const chunk = new Int16Array(bytes.buffer);
+          audioChunks.push(chunk);
+          recordedAudioRate = Number(data.audio_rate_hz) || 16000;
+        } else if (data.audio_adpcm_b64) {
+          const binary = atob(data.audio_adpcm_b64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const chunk = adpcmDecoder.decodeBlock(bytes);
+          audioChunks.push(chunk);
+          recordedAudioRate = Number(data.audio_rate_hz) || 8000;
+        } else if (data.audio_pcm_s8_b64) {
+          const binary = atob(data.audio_pcm_s8_b64);
+          const chunk = new Int16Array(binary.length);
+          for (let i = 0; i < binary.length; i++) chunk[i] = (binary.charCodeAt(i) << 8);
           audioChunks.push(chunk);
           recordedAudioRate = Number(data.audio_rate_hz) || 8000;
         }
@@ -626,21 +727,79 @@
       document.querySelector('#envHum').textContent = `${d.humidity_pct.toFixed(1)} %`;
       document.querySelector('#envPress').textContent = `${d.pressure_hpa.toFixed(1)} hPa`;
       document.querySelector('#envGas').textContent = `${Number(d.gas_ohms).toLocaleString()} Ω`;
+
+      if (d.iaq !== undefined) {
+        const iaq = Number(d.iaq);
+        const voc = Number(d.voc_ppm).toFixed(2);
+        const eco2 = Math.round(Number(d.eco2_ppm));
+
+        const iaqValEl = document.querySelector('#iaqVal');
+        const vocValEl = document.querySelector('#vocVal');
+        const eco2ValEl = document.querySelector('#eco2Val');
+        const iaqBadgeEl = document.querySelector('#iaqBadge');
+        const iaqStatusTextEl = document.querySelector('#iaqStatusText');
+
+        if (iaqValEl) iaqValEl.textContent = iaq.toFixed(1);
+        if (vocValEl) vocValEl.textContent = `${voc} ppm`;
+        if (eco2ValEl) eco2ValEl.textContent = `${eco2} ppm`;
+
+        if (iaq <= 50) {
+          if (iaqBadgeEl) {
+            iaqBadgeEl.textContent = '🟢 Good (0-50)';
+            iaqBadgeEl.style.background = 'rgba(52, 211, 153, 0.15)';
+            iaqBadgeEl.style.color = '#34d399';
+            iaqBadgeEl.style.borderColor = 'rgba(52, 211, 153, 0.3)';
+          }
+          if (iaqValEl) iaqValEl.style.color = '#34d399';
+          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Good Air Quality'; iaqStatusTextEl.style.color = '#34d399'; }
+        } else if (iaq <= 100) {
+          if (iaqBadgeEl) {
+            iaqBadgeEl.textContent = '🟡 Moderate (51-100)';
+            iaqBadgeEl.style.background = 'rgba(251, 191, 36, 0.15)';
+            iaqBadgeEl.style.color = '#fbbf24';
+            iaqBadgeEl.style.borderColor = 'rgba(251, 191, 36, 0.3)';
+          }
+          if (iaqValEl) iaqValEl.style.color = '#fbbf24';
+          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Moderate Air Quality'; iaqStatusTextEl.style.color = '#fbbf24'; }
+        } else if (iaq <= 200) {
+          if (iaqBadgeEl) {
+            iaqBadgeEl.textContent = '🟠 Poor (101-200)';
+            iaqBadgeEl.style.background = 'rgba(249, 115, 22, 0.15)';
+            iaqBadgeEl.style.color = '#f97316';
+            iaqBadgeEl.style.borderColor = 'rgba(249, 115, 22, 0.3)';
+          }
+          if (iaqValEl) iaqValEl.style.color = '#f97316';
+          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Poor Air Quality'; iaqStatusTextEl.style.color = '#f97316'; }
+        } else {
+          if (iaqBadgeEl) {
+            iaqBadgeEl.textContent = '🔴 Hazardous (201+)';
+            iaqBadgeEl.style.background = 'rgba(244, 63, 94, 0.15)';
+            iaqBadgeEl.style.color = '#f43f5e';
+            iaqBadgeEl.style.borderColor = 'rgba(244, 63, 94, 0.3)';
+          }
+          if (iaqValEl) iaqValEl.style.color = '#f43f5e';
+          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Hazardous Air!'; iaqStatusTextEl.style.color = '#f43f5e'; }
+        }
+      }
+
       if (d.battery_v !== undefined) {
         const v = Number(d.battery_v).toFixed(2);
         const pct = Number(d.battery_pct);
         const batEl = document.querySelector('#batVal');
         const batStat = document.querySelector('#batStatus');
-        batEl.textContent = `${v} V (${pct}%)`;
-        if (pct >= 50) {
-          batEl.style.color = 'var(--accent-green)';
-          batStat.textContent = '🔋 Battery Level Normal';
-        } else if (pct >= 20) {
-          batEl.style.color = 'var(--accent-amber)';
-          batStat.textContent = '🟡 Battery Level Moderate';
-        } else {
-          batEl.style.color = 'var(--accent-rose)';
-          batStat.textContent = '🔴 Battery Low - Recharge Soon';
+
+        if (batEl && batStat) {
+          batEl.textContent = `🔋 ${v} V (${pct}%)`;
+          if (pct >= 50) {
+            batEl.style.color = 'var(--accent-green)';
+            batStat.textContent = '🔋 Battery Level Normal';
+          } else if (pct >= 20) {
+            batEl.style.color = 'var(--accent-amber)';
+            batStat.textContent = '🟡 Battery Level Moderate';
+          } else {
+            batEl.style.color = 'var(--accent-rose)';
+            batStat.textContent = '🔴 Battery Low - Recharge Soon';
+          }
         }
       }
     }
@@ -863,7 +1022,7 @@
       const channel = audioBuffer.getChannelData(0);
       let offset = 0;
       for (const chunk of audioChunks) {
-        for (let i = 0; i < chunk.length; i++) channel[offset++] = chunk[i] / 128;
+        for (let i = 0; i < chunk.length; i++) channel[offset++] = chunk[i] / 32768;
       }
       playbackSource = context.createBufferSource();
       playbackSource.buffer = audioBuffer;
@@ -880,15 +1039,6 @@
     document.querySelector('#stop').onclick = stopRecording;
     document.querySelector('#play').onclick = playAudio;
 
-    let batterySaveActive = false;
-    document.querySelector('#batterySaveBtn').onclick = async () => {
-      try {
-        await sendCommand({ cmd: 'toggle_battery_save' });
-        batterySaveActive = !batterySaveActive;
-        document.querySelector('#batterySaveBtn').classList.toggle('active', batterySaveActive);
-        showTransientStatus(batterySaveActive ? '🔋 Battery save mode ENABLED (LED pulse 5s)' : '⚡ Normal power mode (LED continuous status)', 3500);
-      } catch (e) { showTransientStatus('⚠️ Battery save error: ' + e.message, 4000); }
-    };
 
     document.querySelector('#clock').onclick = async () => {
       try {
@@ -898,7 +1048,7 @@
     };
 
     document.querySelector('#clear').onclick = () => {
-      recording = false; rows = []; audioChunks = [];
+      recording = false; rows = []; audioChunks = []; adpcmDecoder.reset();
       document.querySelector('#record').disabled = false;
       document.querySelector('#stop').disabled = true;
       document.querySelector('#play').disabled = true;

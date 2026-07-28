@@ -6,10 +6,14 @@
 #include <Adafruit_NeoPixel.h>
 #include <NimBLEDevice.h>
 #include <driver/i2s.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include "ima_adpcm.h"
 
 // Feather V2 pin labels: A0=GPIO26, A1=GPIO25, A5=GPIO4.
 // A3/GPIO39 is input-only and cannot generate LRCL. Rewire LRCL to A5.
@@ -21,12 +25,13 @@ constexpr gpio_num_t PIN_BATTERY = GPIO_NUM_35;
 constexpr gpio_num_t STATUS_NEOPIXEL_PIN = GPIO_NUM_0;
 constexpr gpio_num_t STATUS_NEOPIXEL_POWER_PIN = GPIO_NUM_2;
 constexpr uint32_t MIC_SAMPLE_RATE = 16000;
-constexpr uint32_t AUDIO_PLAYBACK_RATE = 8000;
+constexpr uint32_t AUDIO_PLAYBACK_RATE_USB = 16000;
+constexpr uint32_t AUDIO_PLAYBACK_RATE_BLE = 8000;
 
 constexpr uint32_t IMU_INTERVAL_MS = 10;       // 100 Hz sensor acquisition
 constexpr uint32_t PACKET_INTERVAL_MS = 100;   // ten samples per telemetry packet
 constexpr uint32_t ENV_INTERVAL_MS = 1000;
-constexpr size_t AUDIO_PLAYBACK_BUFFER_SIZE = AUDIO_PLAYBACK_RATE * PACKET_INTERVAL_MS / 1000;
+constexpr size_t AUDIO_PCM16_BUFFER_SIZE = MIC_SAMPLE_RATE * PACKET_INTERVAL_MS / 1000; // 1600 samples
 constexpr size_t BLE_MAX_CHUNK_BYTES = 180;
 
 static const char *DEVICE_NAME = "PAL-V2-Telemetry";
@@ -63,22 +68,54 @@ uint32_t lastImuMs = 0;
 uint32_t lastPacketMs = 0;
 uint32_t lastEnvMs = 0;
 uint32_t lastLedUpdateMs = 0;
-uint32_t lastBleActivityMs = 0;
+volatile uint32_t lastBleActivityMs = 0;
 uint32_t bmeReadyAtMs = 0;
 bool bmeReading = false;
 bool audioStreaming = false;
 double audioSquareSum = 0.0;
 uint32_t audioSampleCount = 0;
-int8_t audioPlaybackSamples[AUDIO_PLAYBACK_BUFFER_SIZE];
-size_t audioPlaybackCount = 0;
-bool keepPlaybackSample = false;
+int16_t audioPcm16Samples[AUDIO_PCM16_BUFFER_SIZE];
+size_t audioPcm16Count = 0;
+ImaAdpcmEncoder bleAdpcmEncoder;
 
 struct CommandMessage {
   char text[257];
 };
 
 QueueHandle_t commandQueue = nullptr;
+QueueHandle_t telemetryQueue = nullptr;
+SemaphoreHandle_t i2cMutex = nullptr;
+SemaphoreHandle_t audioMutex = nullptr;
+
 bool batterySaveMode = false;
+
+class I2CLock {
+public:
+  I2CLock() {
+    if (i2cMutex != nullptr) {
+      xSemaphoreTake(i2cMutex, portMAX_DELAY);
+    }
+  }
+  ~I2CLock() {
+    if (i2cMutex != nullptr) {
+      xSemaphoreGive(i2cMutex);
+    }
+  }
+};
+
+class AudioLock {
+public:
+  AudioLock() {
+    if (audioMutex != nullptr) {
+      xSemaphoreTake(audioMutex, portMAX_DELAY);
+    }
+  }
+  ~AudioLock() {
+    if (audioMutex != nullptr) {
+      xSemaphoreGive(audioMutex);
+    }
+  }
+};
 
 String encodeBase64(const uint8_t *data, size_t length) {
   static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -97,6 +134,7 @@ String encodeBase64(const uint8_t *data, size_t length) {
   return encoded;
 }
 
+
 float readBatteryVoltage() {
   // Adafruit Feather ESP32 V2 uses a 1:2 voltage divider (two 100k resistors) on GPIO35.
   const uint32_t raw = analogRead(PIN_BATTERY);
@@ -110,6 +148,49 @@ uint8_t calculateBatteryPercentage(float vBat) {
   if (vBat <= 3.30f) return 0;
   return static_cast<uint8_t>(constrain((vBat - 3.30f) / (4.20f - 3.30f) * 100.0f, 0.0f, 100.0f));
 }
+
+struct IaqResult {
+  float iaq;
+  float vocPpm;
+  float eco2Ppm;
+};
+
+IaqResult calculateIaqScore(float tempC, float humPct, uint32_t gasOhms) {
+  if (gasOhms == 0) {
+    return {0.0f, 0.0f, 400.0f};
+  }
+
+  // 1. Humidity Contribution (25% weight)
+  float sHum = 0.0f;
+  if (humPct >= 38.0f && humPct <= 42.0f) {
+    sHum = 25.0f;
+  } else if (humPct < 38.0f) {
+    sHum = (0.25f / 40.0f) * humPct * 100.0f;
+  } else {
+    sHum = ((-0.25f / 60.0f) * humPct + 0.4166f) * 100.0f;
+  }
+
+  // 2. Gas Resistance Contribution (75% weight)
+  float rGas = static_cast<float>(gasOhms);
+  constexpr float R_UPPER = 50000.0f; // Good air
+  constexpr float R_LOWER = 5000.0f;  // Bad air
+  if (rGas > R_UPPER) rGas = R_UPPER;
+  if (rGas < R_LOWER) rGas = R_LOWER;
+
+  float sGas = ((0.75f / (R_UPPER - R_LOWER)) * rGas - (R_LOWER * (0.75f / (R_UPPER - R_LOWER)))) * 100.0f;
+
+  // 3. IAQ Score and VOC estimation
+  float iaqPct = sHum + sGas; // 100% = perfectly clean
+  float rawIaq = (100.0f - iaqPct) * 5.0f; // 0 = best, 500 = worst
+  if (rawIaq < 0.0f) rawIaq = 0.0f;
+  if (rawIaq > 500.0f) rawIaq = 500.0f;
+
+  const float vocPpm = (rawIaq / 500.0f) * 10.0f;
+  const float eco2Ppm = 400.0f + (rawIaq * 8.0f);
+
+  return {rawIaq, vocPpm, eco2Ppm};
+}
+
 
 enum SystemStatusColor {
   COLOR_BLUE,   // BLE Connected
@@ -127,8 +208,12 @@ SystemStatusColor evaluateSystemStatus(bool bleConn, bool rtcOk, bool rtcSyncNee
 
 void performSafeBleDisconnect() {
   bleSubscribed = false;
-  audioStreaming = false;
-  audioPlaybackCount = 0;
+  {
+    AudioLock lock;
+    audioStreaming = false;
+    audioPcm16Count = 0;
+    bleAdpcmEncoder.reset();
+  }
   const uint16_t handle = bleConnectionHandle;
   bleConnectionHandle = BLE_HS_CONN_HANDLE_NONE;
 
@@ -215,6 +300,7 @@ uint64_t nowUnixMs() {
 }
 
 void syncClockBase() {
+  I2CLock lock;
   DateTime now = rtc.now();
   clockBaseMs = static_cast<uint64_t>(now.unixtime()) * 1000ULL;
   clockBaseMillis = millis();
@@ -254,10 +340,19 @@ void sendLine(const String &line) {
   }
 }
 
+void enqueueTelemetry(const String &line) {
+  if (telemetryQueue == nullptr) return;
+  char *msg = strdup(line.c_str());
+  if (msg == nullptr) return;
+  if (xQueueSend(telemetryQueue, &msg, 0) != pdTRUE) {
+    free(msg);
+  }
+}
+
 void sendStatus(const char *state, const char *detail) {
   String message = "{\"type\":\"status\",\"time_ms\":" + String(nowUnixMs()) +
                    ",\"state\":\"" + state + "\",\"detail\":\"" + detail + "\"}";
-  sendLine(message);
+  enqueueTelemetry(message);
 }
 
 void setRtcFromUnixMs(uint64_t unixMs) {
@@ -265,7 +360,10 @@ void setRtcFromUnixMs(uint64_t unixMs) {
     sendStatus("command_error", "DS3231 is unavailable; clock was not changed");
     return;
   }
-  rtc.adjust(DateTime(static_cast<uint32_t>(unixMs / 1000ULL)));
+  {
+    I2CLock lock;
+    rtc.adjust(DateTime(static_cast<uint32_t>(unixMs / 1000ULL)));
+  }
   clockBaseMs = unixMs;
   clockBaseMillis = millis();
   rtcNeedsSync = false;
@@ -290,14 +388,22 @@ void handleCommand(String command) {
     return;
   }
   if (command.indexOf("start_audio") >= 0) {
-    audioStreaming = true;
-    audioPlaybackCount = 0;
+    {
+      AudioLock lock;
+      audioStreaming = true;
+      audioPcm16Count = 0;
+      bleAdpcmEncoder.reset();
+    }
     sendStatus("recording", "PCM audio stream started");
     return;
   }
   if (command.indexOf("stop_audio") >= 0) {
-    audioStreaming = false;
-    audioPlaybackCount = 0;
+    {
+      AudioLock lock;
+      audioStreaming = false;
+      audioPcm16Count = 0;
+      bleAdpcmEncoder.reset();
+    }
     sendStatus("recording_stopped", "PCM audio stream stopped");
     return;
   }
@@ -335,6 +441,7 @@ class CommandCallbacks : public NimBLECharacteristicCallbacks {
       strncpy(message.text, "command_too_long", sizeof(message.text) - 1);
     } else {
       memcpy(message.text, value.data(), value.length());
+      message.text[value.length()] = '\0';
     }
     xQueueSend(commandQueue, &message, 0);
   }
@@ -420,6 +527,13 @@ void readMicrophone() {
   size_t bytesRead = 0;
   if (i2s_read(microphonePort, frames, sizeof(frames), &bytesRead, 0) != ESP_OK) return;
   const size_t words = bytesRead / sizeof(int32_t);
+  if (words == 0) return;
+
+  double sumSq = 0.0;
+  uint32_t count = 0;
+  int16_t pcmBuf[64];
+  size_t pcmCount = 0;
+
   for (size_t i = 0; i + 1 < words; i += 2) {
     // Accumulate normalized PCM energy for a 100 ms RMS dBFS reading.
     // ICS43434 drives only its SEL-selected slot; choose whichever slot is active.
@@ -427,86 +541,211 @@ void readMicrophone() {
     const int64_t rightMagnitude = frames[i + 1] < 0 ? -static_cast<int64_t>(frames[i + 1]) : frames[i + 1];
     const int32_t raw = leftMagnitude >= rightMagnitude ? frames[i] : frames[i + 1];
     const double normalized = static_cast<double>(raw) / 2147483648.0;
-    audioSquareSum += normalized * normalized;
-    ++audioSampleCount;
-    keepPlaybackSample = !keepPlaybackSample;
-    if (audioStreaming && keepPlaybackSample && audioPlaybackCount < AUDIO_PLAYBACK_BUFFER_SIZE) {
-      // Downsample to 8 kHz and quantize the left-justified microphone PCM to
-      // signed 8-bit audio for bandwidth-efficient browser playback.
-      audioPlaybackSamples[audioPlaybackCount++] = static_cast<int8_t>(constrain(raw >> 24, -128, 127));
+    sumSq += normalized * normalized;
+    ++count;
+    if (pcmCount < 64) {
+      // Quantize 32-bit left-justified I2S PCM to 16-bit signed PCM
+      pcmBuf[pcmCount++] = static_cast<int16_t>(constrain(raw >> 16, -32768, 32767));
+    }
+  }
+
+  {
+    AudioLock lock;
+    audioSquareSum += sumSq;
+    audioSampleCount += count;
+    if (audioStreaming) {
+      for (size_t i = 0; i < pcmCount && audioPcm16Count < AUDIO_PCM16_BUFFER_SIZE; ++i) {
+        audioPcm16Samples[audioPcm16Count++] = pcmBuf[i];
+      }
     }
   }
 }
 
-void collectImu() {
-  if (!imuReady || imuCount == sizeof(imuSamples) / sizeof(imuSamples[0])) return;
-  sensors_event_t accel, gyro, temp;
-  lsm6dsox.getEvent(&accel, &gyro, &temp);
-  ImuSample &sample = imuSamples[imuCount++];
-  sample.offsetMs = millis() - lastPacketMs;
-  sample.ax = accel.acceleration.x;
-  sample.ay = accel.acceleration.y;
-  sample.az = accel.acceleration.z;
-  sample.gx = gyro.gyro.x;
-  sample.gy = gyro.gyro.y;
-  sample.gz = gyro.gyro.z;
+void configureImuFifo() {
+  if (!imuReady) return;
+  I2CLock lock;
+  // FIFO_CTRL3 (0x09): BDR_GY[3:0] = 0x04 (104 Hz), BDR_XL[3:0] = 0x04 (104 Hz) -> 0x44
+  Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
+  Wire.write(0x09);
+  Wire.write(0x44);
+  Wire.endTransmission();
+
+  // FIFO_CTRL4 (0x0A): FIFO_MODE[2:0] = 0x03 (Continuous Mode)
+  Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
+  Wire.write(0x0A);
+  Wire.write(0x03);
+  Wire.endTransmission();
+}
+
+void readImuFifoBurst() {
+  if (!imuReady) return;
+
+  I2CLock lock;
+  Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
+  Wire.write(0x3A); // FIFO_STATUS1
+  if (Wire.endTransmission() != 0) return;
+
+  Wire.requestFrom(static_cast<uint8_t>(LSM6DS_I2CADDR_DEFAULT), static_cast<uint8_t>(2));
+  if (Wire.available() < 2) return;
+  const uint8_t lsb = Wire.read();
+  const uint8_t msb = Wire.read();
+  uint16_t numWords = lsb | ((msb & 0x07) << 8);
+
+  if (numWords == 0) return;
+  if (numWords > 32) numWords = 32;
+
+  static float lastAx = 0.0f, lastAy = 0.0f, lastAz = 0.0f;
+  static float lastGx = 0.0f, lastGy = 0.0f, lastGz = 0.0f;
+
+  for (uint16_t i = 0; i < numWords; ++i) {
+    Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
+    Wire.write(0x78); // FIFO_DATA_OUT_TAG
+    if (Wire.endTransmission() != 0) break;
+
+    Wire.requestFrom(static_cast<uint8_t>(LSM6DS_I2CADDR_DEFAULT), static_cast<uint8_t>(7));
+    if (Wire.available() < 7) break;
+
+    uint8_t rawBytes[7];
+    for (int b = 0; b < 7; ++b) {
+      rawBytes[b] = Wire.read();
+    }
+
+    const uint8_t tag = rawBytes[0] >> 3;
+    const int16_t rawX = static_cast<int16_t>(rawBytes[1] | (rawBytes[2] << 8));
+    const int16_t rawY = static_cast<int16_t>(rawBytes[3] | (rawBytes[4] << 8));
+    const int16_t rawZ = static_cast<int16_t>(rawBytes[5] | (rawBytes[6] << 8));
+
+    if (tag == 0x02) { // Accel tag
+      constexpr float ACCEL_SCALE_MS2 = 0.122f * 9.80665f / 1000.0f;
+      lastAx = static_cast<float>(rawX) * ACCEL_SCALE_MS2;
+      lastAy = static_cast<float>(rawY) * ACCEL_SCALE_MS2;
+      lastAz = static_cast<float>(rawZ) * ACCEL_SCALE_MS2;
+    } else if (tag == 0x01) { // Gyro tag
+      constexpr float GYRO_SCALE_RADS = 17.50f * (3.14159265f / 180.0f) / 1000.0f;
+      lastGx = static_cast<float>(rawX) * GYRO_SCALE_RADS;
+      lastGy = static_cast<float>(rawY) * GYRO_SCALE_RADS;
+      lastGz = static_cast<float>(rawZ) * GYRO_SCALE_RADS;
+
+      if (imuCount < sizeof(imuSamples) / sizeof(imuSamples[0])) {
+        ImuSample &sample = imuSamples[imuCount++];
+        sample.offsetMs = millis() - lastPacketMs;
+        sample.ax = lastAx;
+        sample.ay = lastAy;
+        sample.az = lastAz;
+        sample.gx = lastGx;
+        sample.gy = lastGy;
+        sample.gz = lastGz;
+      }
+    }
+  }
 }
 
 void sendTelemetryPacket() {
   const uint32_t elapsedMs = millis() - lastPacketMs;
   const uint64_t audioTime = nowUnixMs();
   const uint64_t packetTime = audioTime - elapsedMs;
+
+  double currentAudioSquareSum = 0.0;
+  uint32_t currentAudioSampleCount = 0;
+  int16_t currentAudioPcm16Samples[AUDIO_PCM16_BUFFER_SIZE];
+  size_t currentAudioPcm16Count = 0;
+  bool currentAudioStreaming = false;
+
+  {
+    AudioLock lock;
+    currentAudioSquareSum = audioSquareSum;
+    currentAudioSampleCount = audioSampleCount;
+    currentAudioPcm16Count = audioPcm16Count;
+    currentAudioStreaming = audioStreaming;
+    if (audioPcm16Count > 0) {
+      memcpy(currentAudioPcm16Samples, audioPcm16Samples, audioPcm16Count * sizeof(int16_t));
+    }
+    audioSquareSum = 0.0;
+    audioSampleCount = 0;
+    audioPcm16Count = 0;
+  }
+
   String packet = "{\"type\":\"telemetry\",\"time_ms\":" + String(packetTime) + ",\"imu\":[";
-  packet.reserve(audioStreaming ? 2400 : 1200);
+  packet.reserve(currentAudioStreaming ? 2400 : 1200);
   for (size_t i = 0; i < imuCount; ++i) {
     const ImuSample &s = imuSamples[i];
     if (i) packet += ',';
     packet += "[" + String(s.offsetMs) + ',' + String(s.ax, 4) + ',' + String(s.ay, 4) + ',' +
               String(s.az, 4) + ',' + String(s.gx, 4) + ',' + String(s.gy, 4) + ',' + String(s.gz, 4) + "]";
   }
-  // dBFS is relative to the digital microphone's full-scale PCM value. A
-  // calibrated dB SPL value would additionally require an acoustic calibrator.
+
   constexpr double DBFS_FLOOR = -120.0;
   double audioDbfs = DBFS_FLOOR;
-  if (audioSampleCount > 0 && audioSquareSum > 0.0) {
-    const double rms = sqrt(audioSquareSum / audioSampleCount);
+  if (currentAudioSampleCount > 0 && currentAudioSquareSum > 0.0) {
+    const double rms = sqrt(currentAudioSquareSum / currentAudioSampleCount);
     audioDbfs = max(DBFS_FLOOR, 20.0 * log10(rms));
   }
   packet += "],\"audio_time_ms\":" + String(audioTime) +
-            ",\"audio_samples\":" + String(audioSampleCount) +
+            ",\"audio_samples\":" + String(currentAudioSampleCount) +
             ",\"audio_dbfs\":" + String(audioDbfs, 2);
-  if (audioStreaming) {
-    packet += ",\"audio_rate_hz\":" + String(AUDIO_PLAYBACK_RATE) +
-              ",\"audio_pcm_s8_b64\":\"" +
-              encodeBase64(reinterpret_cast<const uint8_t *>(audioPlaybackSamples), audioPlaybackCount) + "\"";
+  if (currentAudioStreaming) {
+    if (!bleSubscribed) {
+      // USB Serial (Wired): output 16-bit 16 kHz signed PCM audio Base64 (audio_pcm_s16_b64)
+      packet += ",\"audio_rate_hz\":" + String(AUDIO_PLAYBACK_RATE_USB) +
+                ",\"audio_pcm_s16_b64\":\"" +
+                encodeBase64(reinterpret_cast<const uint8_t *>(currentAudioPcm16Samples), currentAudioPcm16Count * sizeof(int16_t)) + "\"";
+    } else {
+      // BLE Wireless: output 4-bit IMA-ADPCM compressed audio Base64 (audio_adpcm_b64)
+      // Downsample 16 kHz to 8 kHz by taking every 2nd sample
+      int16_t pcm8k[AUDIO_PCM16_BUFFER_SIZE / 2];
+      size_t count8k = 0;
+      for (size_t i = 0; i < currentAudioPcm16Count; i += 2) {
+        pcm8k[count8k++] = currentAudioPcm16Samples[i];
+      }
+      uint8_t adpcmBuf[AUDIO_PCM16_BUFFER_SIZE / 4];
+      const size_t adpcmBytes = bleAdpcmEncoder.encodeBlock(pcm8k, count8k, adpcmBuf);
+      packet += ",\"audio_rate_hz\":" + String(AUDIO_PLAYBACK_RATE_BLE) +
+                ",\"audio_adpcm_b64\":\"" +
+                encodeBase64(adpcmBuf, adpcmBytes) + "\"";
+    }
   }
   packet += '}';
-  sendLine(packet);
+  enqueueTelemetry(packet);
   imuCount = 0;
-  audioSquareSum = 0.0;
-  audioSampleCount = 0;
-  audioPlaybackCount = 0;
 }
 
 void sendEnvironment() {
-  if (!bme.endReading()) {
+  bool bmeSuccess = false;
+  float tempC = 0.0f, humPct = 0.0f, pressPa = 0.0f;
+  uint32_t gasOhms = 0;
+  {
+    I2CLock lock;
+    if (bme.endReading()) {
+      bmeSuccess = true;
+      tempC = bme.temperature;
+      humPct = bme.humidity;
+      pressPa = bme.pressure;
+      gasOhms = bme.gas_resistance;
+    }
+  }
+  if (!bmeSuccess) {
     sendStatus("sensor_error", "BME688 read failed");
     return;
   }
   const float vBat = readBatteryVoltage();
   const uint8_t pctBat = calculateBatteryPercentage(vBat);
+  const IaqResult iaqRes = calculateIaqScore(tempC, humPct, gasOhms);
   String packet = "{\"type\":\"environment\",\"time_ms\":" + String(nowUnixMs()) +
-                  ",\"temperature_c\":" + String(bme.temperature, 2) +
-                  ",\"humidity_pct\":" + String(bme.humidity, 2) +
-                  ",\"pressure_hpa\":" + String(bme.pressure / 100.0F, 2) +
-                  ",\"gas_ohms\":" + String(bme.gas_resistance) +
+                  ",\"temperature_c\":" + String(tempC, 2) +
+                  ",\"humidity_pct\":" + String(humPct, 2) +
+                  ",\"pressure_hpa\":" + String(pressPa / 100.0F, 2) +
+                  ",\"gas_ohms\":" + String(gasOhms) +
+                  ",\"iaq\":" + String(iaqRes.iaq, 1) +
+                  ",\"voc_ppm\":" + String(iaqRes.vocPpm, 2) +
+                  ",\"eco2_ppm\":" + String(iaqRes.eco2Ppm, 1) +
                   ",\"battery_v\":" + String(vBat, 2) +
                   ",\"battery_pct\":" + String(pctBat) + "}";
-  sendLine(packet);
+  enqueueTelemetry(packet);
 }
 
 void startEnvironmentReading() {
   if (!bmeReady || bmeReading) return;
+  I2CLock lock;
   const uint32_t readyAt = bme.beginReading();
   if (readyAt == 0) {
     sendStatus("sensor_error", "BME688 start failed");
@@ -525,7 +764,11 @@ void readSerialCommands() {
       if (discarding) {
         sendStatus("command_error", "Serial command exceeded 256 bytes");
       } else if (!input.isEmpty()) {
-        handleCommand(input);
+        if (commandQueue != nullptr) {
+          CommandMessage message = {};
+          strncpy(message.text, input.c_str(), sizeof(message.text) - 1);
+          xQueueSend(commandQueue, &message, 0);
+        }
       }
       input = "";
       discarding = false;
@@ -549,9 +792,66 @@ void readBleCommands() {
   }
 }
 
+void telemetry_net_task(void *pvParameters) {
+  (void)pvParameters;
+  for (;;) {
+    readSerialCommands();
+    readMicrophone();
+
+    char *msg = nullptr;
+    while (telemetryQueue != nullptr && xQueueReceive(telemetryQueue, &msg, 0) == pdTRUE) {
+      if (msg != nullptr) {
+        sendLine(String(msg));
+        free(msg);
+      }
+    }
+
+    checkBleSafetyTimeout();
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+void sensor_app_task(void *pvParameters) {
+  (void)pvParameters;
+  for (;;) {
+    readBleCommands();
+
+    const uint32_t now = millis();
+    if (now - lastImuMs >= IMU_INTERVAL_MS) {
+      lastImuMs = now;
+      readImuFifoBurst();
+    }
+    if (now - lastPacketMs >= PACKET_INTERVAL_MS) {
+      sendTelemetryPacket();
+      lastPacketMs = now;
+    }
+    if (bmeReading && static_cast<int32_t>(now - bmeReadyAtMs) >= 0) {
+      sendEnvironment();
+      bmeReading = false;
+    }
+    if (now - lastEnvMs >= ENV_INTERVAL_MS) {
+      lastEnvMs = now;
+      startEnvironmentReading();
+    }
+    if (now - lastLedUpdateMs >= 250) {
+      lastLedUpdateMs = now;
+      updateNeoPixelStatus();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  i2cMutex = xSemaphoreCreateMutex();
+  audioMutex = xSemaphoreCreateMutex();
+  telemetryQueue = xQueueCreate(16, sizeof(char *));
+  commandQueue = xQueueCreate(8, sizeof(CommandMessage));
+
   pinMode(STATUS_NEOPIXEL_POWER_PIN, OUTPUT);
   digitalWrite(STATUS_NEOPIXEL_POWER_PIN, HIGH);
   pixel.begin();
@@ -577,72 +877,85 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   Wire.begin(); // STEMMA QT uses SDA=GPIO22 and SCL=GPIO20 on this Feather.
-  commandQueue = xQueueCreate(4, sizeof(CommandMessage));
 
-  rtcReady = rtc.begin();
-  if (rtcReady) {
-    rtcNeedsSync = rtc.lostPower();
-    if (rtcNeedsSync) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    syncClockBase();
-  } else {
-    clockBaseMs = 0;
-    clockBaseMillis = millis();
-  }
+  {
+    I2CLock lock;
+    rtcReady = rtc.begin();
+    if (rtcReady) {
+      rtcNeedsSync = rtc.lostPower();
+      if (rtcNeedsSync) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      DateTime now = rtc.now();
+      clockBaseMs = static_cast<uint64_t>(now.unixtime()) * 1000ULL;
+      clockBaseMillis = millis();
+    } else {
+      clockBaseMs = 0;
+      clockBaseMillis = millis();
+    }
 
-  bmeReady = bme.begin(0x77) || bme.begin(0x76);
-  if (bmeReady) {
-    bme.setTemperatureOversampling(BME680_OS_8X);
-    bme.setHumidityOversampling(BME680_OS_2X);
-    bme.setPressureOversampling(BME680_OS_4X);
-    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150);
-  }
+    bmeReady = bme.begin(0x77) || bme.begin(0x76);
+    if (bmeReady) {
+      bme.setTemperatureOversampling(BME680_OS_8X);
+      bme.setHumidityOversampling(BME680_OS_2X);
+      bme.setPressureOversampling(BME680_OS_4X);
+      bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+      bme.setGasHeater(320, 150);
+    }
 
-  imuReady = lsm6dsox.begin_I2C();
-  if (imuReady) {
-    lsm6dsox.setAccelRange(LSM6DS_ACCEL_RANGE_4_G);
-    lsm6dsox.setGyroRange(LSM6DS_GYRO_RANGE_500_DPS);
-    lsm6dsox.setAccelDataRate(LSM6DS_RATE_104_HZ);
-    lsm6dsox.setGyroDataRate(LSM6DS_RATE_104_HZ);
+    imuReady = lsm6dsox.begin_I2C();
+    if (imuReady) {
+      lsm6dsox.setAccelRange(LSM6DS_ACCEL_RANGE_4_G);
+      lsm6dsox.setGyroRange(LSM6DS_GYRO_RANGE_500_DPS);
+      lsm6dsox.setAccelDataRate(LSM6DS_RATE_104_HZ);
+      lsm6dsox.setGyroDataRate(LSM6DS_RATE_104_HZ);
+
+      Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
+      Wire.write(0x09);
+      Wire.write(0x44);
+      Wire.endTransmission();
+
+      Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
+      Wire.write(0x0A);
+      Wire.write(0x03);
+      Wire.endTransmission();
+    }
   }
 
   beginMicrophone();
   beginBle();
+
   lastPacketMs = millis();
   lastImuMs = lastPacketMs;
   lastEnvMs = millis();
   startEnvironmentReading();
+
   sendStatus("ready", "JSON Lines over USB serial and BLE notifications");
   if (!rtcReady) sendStatus("sensor_error", "DS3231 not found");
   if (rtcNeedsSync) sendStatus("clock_warning", "RTC lost power; synchronize it from the dashboard");
   if (!imuReady) sendStatus("sensor_error", "LSM6DSOX not found");
   if (!bmeReady) sendStatus("sensor_error", "BME688 not found");
   if (!micReady) sendStatus("sensor_error", "ICS43434 I2S setup failed");
+
+  xTaskCreatePinnedToCore(
+    telemetry_net_task,
+    "telemetry_net",
+    8192,
+    nullptr,
+    2,
+    nullptr,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    sensor_app_task,
+    "sensor_app",
+    8192,
+    nullptr,
+    2,
+    nullptr,
+    1
+  );
 }
 
 void loop() {
-  readBleCommands();
-  readSerialCommands();
-  readMicrophone();
-  const uint32_t now = millis();
-  if (now - lastImuMs >= IMU_INTERVAL_MS) {
-    lastImuMs = now;
-    collectImu();
-  }
-  if (now - lastPacketMs >= PACKET_INTERVAL_MS) {
-    sendTelemetryPacket();
-    lastPacketMs = now;
-  }
-  if (bmeReading && static_cast<int32_t>(now - bmeReadyAtMs) >= 0) {
-    sendEnvironment();
-    bmeReading = false;
-  }
-  if (now - lastEnvMs >= ENV_INTERVAL_MS) {
-    lastEnvMs = now;
-    startEnvironmentReading();
-  }
-  if (now - lastLedUpdateMs >= 250) {
-    lastLedUpdateMs = now;
-    updateNeoPixelStatus();
-  }
+  vTaskDelete(nullptr);
 }
