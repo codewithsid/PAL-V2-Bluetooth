@@ -11,11 +11,14 @@ Includes a state-of-the-art **Pro Obsidian UI Dashboard** featuring real-time si
 * **FreeRTOS Dual-Core Architecture**:
   * **Core 0 (`telemetry_net_task`)**: Handles NimBLE stack events, Web Serial command processing, and I2S DMA microphone audio collection.
   * **Core 1 (`sensor_app_task`)**: Handles LSM6DSOX FIFO burst reads, BME688 forced measurements, DS3231 RTC drift sync, battery ADC monitoring, JSON telemetry serialization, and NeoPixel LED state machine.
+* **I2C Bus & IMU FIFO Optimizations**:
+  * **400 kHz Fast Mode**: STEMMA QT bus operates in I2C Fast Mode (`Wire.setClock(400000)`), reducing bus transaction latency by 75%.
+  * **Batched FIFO Burst Reads**: LSM6DSOX accelerometer & gyroscope hardware FIFO samples are burst-read in chunks of up to 18 words (126 bytes), cutting I2C Start/Stop transactions per cycle by over 90% and avoiding I2S audio buffer underruns on Core 0.
+* **Hardware-Anchored RTC Time Synchronization**: Anchors absolute UTC time from the DS3231 RTC once at boot/sync (`clockBaseMs`), then interpolates sub-millisecond timestamps using the ESP32's hardware `millis()` counter. This provides 0 I2C bus overhead during 100 Hz data acquisition and handles 32-bit rollover safely.
 * **Smart Audio Codec (Adaptive Resolution)**:
   * **USB Serial**: Streams uncompressed 16-bit 16 kHz signed PCM audio Base64 (`audio_pcm_s16_b64`) for maximum fidelity.
   * **BLE Wireless**: Compresses audio on-the-fly using a custom 4-bit IMA-ADPCM encoder (`audio_adpcm_b64`), achieving a 4:1 compression ratio to fit within BLE bandwidth limits.
 * **Advanced Indoor Air Quality (G6EJD Model)**: Calculates a dynamic IAQ score (0-500) and eTVOC from the BME688 sensor using the robust G6EJD open-source model. It combines a 25% humidity contribution and a 75% gas resistance contribution (anchored at 100,000 Ω baseline resistance and 30% RH) for accurate indoor environmental sensing without closed-source blobs.
-* **LSM6DSOX Hardware FIFO Burst**: Accelerometer and Gyroscope samples are accumulated in the sensor's hardware FIFO and burst-read over I2C to drastically reduce CPU bus overhead.
 * **LiPo Battery Health**: Measures battery level and percentage via the internal voltage divider (`GPIO35`), streaming `"battery_v"` and `"battery_pct"`. 
 * **Onboard RGB NeoPixel Status Priority (GPIO0)**:
   * 🔵 **Blue**: Active Bluetooth LE client connected.

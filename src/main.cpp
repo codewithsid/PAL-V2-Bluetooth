@@ -597,46 +597,53 @@ void readImuFifoBurst() {
   static float lastAx = 0.0f, lastAy = 0.0f, lastAz = 0.0f;
   static float lastGx = 0.0f, lastGy = 0.0f, lastGz = 0.0f;
 
-  for (uint16_t i = 0; i < numWords; ++i) {
+  uint16_t wordsRemaining = numWords;
+  while (wordsRemaining > 0) {
+    uint16_t chunkWords = (wordsRemaining > 18) ? 18 : wordsRemaining;
+    uint8_t bytesToRead = chunkWords * 7;
+
     Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
     Wire.write(0x78); // FIFO_DATA_OUT_TAG
     if (Wire.endTransmission() != 0) break;
 
-    Wire.requestFrom(static_cast<uint8_t>(LSM6DS_I2CADDR_DEFAULT), static_cast<uint8_t>(7));
-    if (Wire.available() < 7) break;
+    Wire.requestFrom(static_cast<uint8_t>(LSM6DS_I2CADDR_DEFAULT), bytesToRead);
+    if (Wire.available() < bytesToRead) break;
 
-    uint8_t rawBytes[7];
-    for (int b = 0; b < 7; ++b) {
-      rawBytes[b] = Wire.read();
-    }
+    for (uint16_t i = 0; i < chunkWords; ++i) {
+      uint8_t rawBytes[7];
+      for (int b = 0; b < 7; ++b) {
+        rawBytes[b] = Wire.read();
+      }
 
-    const uint8_t tag = rawBytes[0] >> 3;
-    const int16_t rawX = static_cast<int16_t>(rawBytes[1] | (rawBytes[2] << 8));
-    const int16_t rawY = static_cast<int16_t>(rawBytes[3] | (rawBytes[4] << 8));
-    const int16_t rawZ = static_cast<int16_t>(rawBytes[5] | (rawBytes[6] << 8));
+      const uint8_t tag = rawBytes[0] >> 3;
+      const int16_t rawX = static_cast<int16_t>(rawBytes[1] | (rawBytes[2] << 8));
+      const int16_t rawY = static_cast<int16_t>(rawBytes[3] | (rawBytes[4] << 8));
+      const int16_t rawZ = static_cast<int16_t>(rawBytes[5] | (rawBytes[6] << 8));
 
-    if (tag == 0x02) { // Accel tag
-      constexpr float ACCEL_SCALE_MS2 = 0.122f * 9.80665f / 1000.0f;
-      lastAx = static_cast<float>(rawX) * ACCEL_SCALE_MS2;
-      lastAy = static_cast<float>(rawY) * ACCEL_SCALE_MS2;
-      lastAz = static_cast<float>(rawZ) * ACCEL_SCALE_MS2;
-    } else if (tag == 0x01) { // Gyro tag
-      constexpr float GYRO_SCALE_RADS = 17.50f * (3.14159265f / 180.0f) / 1000.0f;
-      lastGx = static_cast<float>(rawX) * GYRO_SCALE_RADS;
-      lastGy = static_cast<float>(rawY) * GYRO_SCALE_RADS;
-      lastGz = static_cast<float>(rawZ) * GYRO_SCALE_RADS;
+      if (tag == 0x02) { // Accel tag
+        constexpr float ACCEL_SCALE_MS2 = 0.122f * 9.80665f / 1000.0f;
+        lastAx = static_cast<float>(rawX) * ACCEL_SCALE_MS2;
+        lastAy = static_cast<float>(rawY) * ACCEL_SCALE_MS2;
+        lastAz = static_cast<float>(rawZ) * ACCEL_SCALE_MS2;
+      } else if (tag == 0x01) { // Gyro tag
+        constexpr float GYRO_SCALE_RADS = 17.50f * (3.14159265f / 180.0f) / 1000.0f;
+        lastGx = static_cast<float>(rawX) * GYRO_SCALE_RADS;
+        lastGy = static_cast<float>(rawY) * GYRO_SCALE_RADS;
+        lastGz = static_cast<float>(rawZ) * GYRO_SCALE_RADS;
 
-      if (imuCount < sizeof(imuSamples) / sizeof(imuSamples[0])) {
-        ImuSample &sample = imuSamples[imuCount++];
-        sample.offsetMs = millis() - lastPacketMs;
-        sample.ax = lastAx;
-        sample.ay = lastAy;
-        sample.az = lastAz;
-        sample.gx = lastGx;
-        sample.gy = lastGy;
-        sample.gz = lastGz;
+        if (imuCount < sizeof(imuSamples) / sizeof(imuSamples[0])) {
+          ImuSample &sample = imuSamples[imuCount++];
+          sample.offsetMs = millis() - lastPacketMs;
+          sample.ax = lastAx;
+          sample.ay = lastAy;
+          sample.az = lastAz;
+          sample.gx = lastGx;
+          sample.gy = lastGy;
+          sample.gz = lastGz;
+        }
       }
     }
+    wordsRemaining -= chunkWords;
   }
 }
 
@@ -877,6 +884,7 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   Wire.begin(); // STEMMA QT uses SDA=GPIO22 and SCL=GPIO20 on this Feather.
+  Wire.setClock(400000); // Enable I2C Fast Mode (400 kHz)
 
   {
     I2CLock lock;
