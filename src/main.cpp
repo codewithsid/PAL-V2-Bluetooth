@@ -429,6 +429,12 @@ void handleCommand(String command) {
     return;
   }
   setRtcFromUnixMs(unixMs);
+
+  //Ping Pong for App Inventor Connection
+  if (command.indexOf("ping") >= 0) {
+    sendStatus("pong", "FrED PDM link active");
+    return; 
+  }
 }
 
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
