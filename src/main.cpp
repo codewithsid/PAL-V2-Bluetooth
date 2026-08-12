@@ -33,6 +33,8 @@ constexpr uint32_t PACKET_INTERVAL_MS = 100;   // ten samples per telemetry pack
 constexpr uint32_t ENV_INTERVAL_MS = 1000;
 constexpr size_t AUDIO_PCM16_BUFFER_SIZE = MIC_SAMPLE_RATE * PACKET_INTERVAL_MS / 1000; // 1600 samples
 constexpr size_t BLE_MAX_CHUNK_BYTES = 180;
+constexpr uint32_t BLE_STALL_TIMEOUT_MS = 30000;
+constexpr uint32_t BLE_CHUNK_GAP_MS = 2;
 
 //Change the Device Name to PAL-V2 (smaller name, less bits, can be advertised in 1 packet)
 static const char *DEVICE_NAME = "PAL-V2";
@@ -61,6 +63,8 @@ bool bmeReady = false;
 bool imuReady = false;
 bool micReady = false;
 volatile bool bleSubscribed = false;
+volatile bool bleConnected = false;
+volatile bool bleAdvertising = false;
 volatile size_t bleChunkBytes = 20;
 volatile uint16_t bleConnectionHandle = BLE_HS_CONN_HANDLE_NONE;
 uint64_t clockBaseMs = 0;
@@ -194,14 +198,15 @@ IaqResult calculateIaqScore(float tempC, float humPct, uint32_t gasOhms) {
 
 
 enum SystemStatusColor {
-  COLOR_BLUE,   // BLE Connected
+  COLOR_BLUE,   // BLE advertising or completing the GATT handshake
   COLOR_RED,    // Sensor Error or High Gas Alert
   COLOR_AMBER,  // RTC Drift / Low Battery
-  COLOR_GREEN   // All Systems Normal
+  COLOR_GREEN   // BLE subscribed/streaming, or all systems normal
 };
 
-SystemStatusColor evaluateSystemStatus(bool bleConn, bool rtcOk, bool rtcSyncNeeded, bool imuOk, bool bmeOk, bool micOk, float vBat, uint32_t gasOhms) {
-  if (bleConn) return COLOR_BLUE;
+SystemStatusColor evaluateSystemStatus(bool blePairing, bool bleStreaming, bool rtcOk, bool rtcSyncNeeded, bool imuOk, bool bmeOk, bool micOk, float vBat, uint32_t gasOhms) {
+  if (bleStreaming) return COLOR_GREEN;
+  if (blePairing) return COLOR_BLUE;
   if (!rtcOk || !imuOk || !bmeOk || !micOk || (bmeOk && gasOhms > 0 && gasOhms < 20000)) return COLOR_RED;
   if (rtcSyncNeeded || (vBat > 0.5f && vBat < 3.48f)) return COLOR_AMBER;
   return COLOR_GREEN;
@@ -209,6 +214,7 @@ SystemStatusColor evaluateSystemStatus(bool bleConn, bool rtcOk, bool rtcSyncNee
 
 void performSafeBleDisconnect() {
   bleSubscribed = false;
+  bleConnected = false;
   {
     AudioLock lock;
     audioStreaming = false;
@@ -225,7 +231,9 @@ void performSafeBleDisconnect() {
 
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   if (adv != nullptr && !adv->isAdvertising()) {
-    adv->start();
+    bleAdvertising = adv->start();
+  } else {
+    bleAdvertising = adv != nullptr && adv->isAdvertising();
   }
 }
 
@@ -235,29 +243,32 @@ void checkBleSafetyTimeout() {
   const size_t connCount = server->getConnectedCount();
 
   if (connCount == 0) {
+    bleConnected = false;
     if (bleSubscribed || bleConnectionHandle != BLE_HS_CONN_HANDLE_NONE) {
       performSafeBleDisconnect();
     }
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
     if (adv != nullptr && !adv->isAdvertising()) {
-      adv->start();
+      bleAdvertising = adv->start();
+    } else {
+      bleAdvertising = adv != nullptr && adv->isAdvertising();
     }
     return;
   }
 
   const uint32_t now = millis();
-  if (lastBleActivityMs > 0 && (now - lastBleActivityMs > 15000)) {
+  if (lastBleActivityMs > 0 && (now - lastBleActivityMs > BLE_STALL_TIMEOUT_MS)) {
     performSafeBleDisconnect();
   }
 }
 
 void updateNeoPixelStatus() {
   checkBleSafetyTimeout();
-  NimBLEServer *server = NimBLEDevice::getServer();
-  const bool activeBleConnected = bleSubscribed && (server != nullptr && server->getConnectedCount() > 0);
+  const bool activeBleStreaming = bleConnected && bleSubscribed;
+  const bool activeBlePairing = bleAdvertising || (bleConnected && !bleSubscribed);
   const float vBat = readBatteryVoltage();
   const SystemStatusColor status = evaluateSystemStatus(
-    activeBleConnected, rtcReady, rtcNeedsSync, imuReady, bmeReady, micReady, vBat, bme.gas_resistance
+    activeBlePairing, activeBleStreaming, rtcReady, rtcNeedsSync, imuReady, bmeReady, micReady, vBat, bme.gas_resistance
   );
 
   uint8_t r = 0, g = 0, b = 0;
@@ -325,6 +336,9 @@ void sendLine(const String &line) {
       notifySuccess = false;
       break;
     }
+    if (start + length < line.length()) {
+      vTaskDelay(pdMS_TO_TICKS(BLE_CHUNK_GAP_MS));
+    }
   }
 
   if (notifySuccess) {
@@ -336,9 +350,10 @@ void sendLine(const String &line) {
     }
   }
 
-  if (!notifySuccess) {
-    performSafeBleDisconnect();
-  }
+  // A false return commonly means the controller's notification queue is
+  // temporarily full. Keep the GATT link alive; the inactivity watchdog will
+  // recover a genuinely stalled connection after BLE_STALL_TIMEOUT_MS.
+  if (!notifySuccess) Serial.println("BLE notification dropped (queue busy)");
 }
 
 void enqueueTelemetry(const String &line) {
@@ -464,6 +479,11 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
     if (bleSubscribed) {
       bleConnectionHandle = connInfo.getConnHandle();
       bleChunkBytes = min(BLE_MAX_CHUNK_BYTES, static_cast<size_t>(max(23, static_cast<int>(connInfo.getMTU())) - 3));
+      Serial.printf("BLE STREAM READY: handle=%u, mtu=%u, chunk=%u\n",
+                    connInfo.getConnHandle(), connInfo.getMTU(), static_cast<unsigned>(bleChunkBytes));
+      sendStatus("ble_ready", "Notifications enabled; JSONL stream active");
+    } else {
+      Serial.printf("BLE NOTIFICATIONS DISABLED: handle=%u\n", connInfo.getConnHandle());
     }
   }
 };
@@ -471,9 +491,13 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer * /*server*/, NimBLEConnInfo &connInfo) override {
     lastBleActivityMs = millis();
+    bleConnected = true;
+    bleAdvertising = false;
     bleConnectionHandle = connInfo.getConnHandle();
+    Serial.printf("BLE CONNECTED: handle=%u, mtu=%u\n", connInfo.getConnHandle(), connInfo.getMTU());
   }
-  void onDisconnect(NimBLEServer * /*server*/, NimBLEConnInfo & /*connInfo*/, int /*reason*/) override {
+  void onDisconnect(NimBLEServer * /*server*/, NimBLEConnInfo & /*connInfo*/, int reason) override {
+    Serial.printf("BLE DISCONNECTED: reason=%d\n", reason);
     performSafeBleDisconnect();
   }
 };
@@ -505,23 +529,24 @@ void beginBle() {
   advertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
   advertising->setConnectableMode(BLE_GAP_CONN_MODE_UND);
 
-  //Puts both short name and service UUID in the primary packet
-  advertising->enableScanResponse(false); 
+  // Keep both the short name and service UUID in the primary advertisement.
+  // App Inventor's service-and-name connection helper can then match one packet.
+  advertising->enableScanResponse(false);
 
-  const bool serviceAdded = advertising->setName(DEVICE_NAME); 
+  const bool nameAdded = advertising->setName(DEVICE_NAME);
 
   //Advertise every 50-100 ms while testing
   //Units are 0.625 ms, so 80 = 50 ms, 160 = 100 ms
   advertising->setMinInterval(0x50); //50 ms
   advertising->setMaxInterval(0xA0); //100 ms
 
-  advertising->addServiceUUID(SERVICE_UUID);
-  advertising->enableScanResponse(true);
-  const bool advertisingStarted = advertising->start(); 
+  const bool serviceAdded = advertising->addServiceUUID(SERVICE_UUID);
+  const bool advertisingStarted = advertising->start();
+  bleAdvertising = advertisingStarted;
 
   Serial.printf("BLE advertising: service=%s, name=%s, started=%s\n",
   serviceAdded ? "OK" : "FAILED",
-  serviceAdded ? "OK" : "FAILED",
+  nameAdded ? "OK" : "FAILED",
   advertisingStarted ? "OK" : "FAILED"); 
 }
 

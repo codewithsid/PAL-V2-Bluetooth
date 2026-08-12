@@ -21,10 +21,10 @@ Includes a state-of-the-art **Pro Obsidian UI Dashboard** featuring real-time si
 * **Advanced Indoor Air Quality (G6EJD Model)**: Calculates a dynamic IAQ score (0-500) and eTVOC from the BME688 sensor using the robust G6EJD open-source model. It combines a 25% humidity contribution and a 75% gas resistance contribution (anchored at 100,000 Ω baseline resistance and 30% RH) for accurate indoor environmental sensing without closed-source blobs.
 * **LiPo Battery Health**: Measures battery level and percentage via the internal voltage divider (`GPIO35`), streaming `"battery_v"` and `"battery_pct"`. 
 * **Onboard RGB NeoPixel Status Priority (GPIO0)**:
-  * 🔵 **Blue**: Active Bluetooth LE client connected.
+  * 🔵 **Blue**: Bluetooth LE advertising or connection/subscription handshake in progress.
+  * 🟢 **Green**: Bluetooth notifications are subscribed and telemetry is streaming.
   * 🔴 **Red**: Hardware sensor error or hazardous IAQ levels.
   * 🟡 **Amber**: DS3231 RTC clock sync required or Low Battery.
-  * 🟢 **Green**: All systems operational.
 * **Pro Web Dashboard**: Pure obsidian black theme (`#000000`), frosted glass cards (`backdrop-filter: blur(24px)`), dynamic IAQ status badges, 16-bit audio playback via a custom JavaScript ADPCM decoder, and CSV data export.
 
 ---
@@ -85,6 +85,10 @@ Contains an array of unpacked IMU hardware FIFO samples `[offset_ms, ax, ay, az,
 * **Service UUID**: `7f510001-5b8d-4a84-9c7c-a07142ab6001`
 * **Data Characteristic (Notify/Read)**: `7f510002-5b8d-4a84-9c7c-a07142ab6001`
 * **Command Characteristic (Write)**: `7f510003-5b8d-4a84-9c7c-a07142ab6001`
+
+BLE messages use UTF-8 JSON Lines framing. The data characteristic splits a JSON object across MTU-sized notifications and sends `\n` after the final fragment. App Inventor must concatenate `StringsReceived` fragments until the newline arrives, then decode the complete JSON object. After notification registration succeeds, PAL emits a `status` packet with `state` set to `ble_ready`; sending `{"cmd":"ping"}` returns a `status` packet with `state` set to `pong`.
+
+For MIT App Inventor, request MTU 247 before calling `RegisterForStrings` when possible. The default 23-byte MTU is supported, but requires many more notification fragments.
 
 ---
 
