@@ -34,7 +34,8 @@ constexpr uint32_t ENV_INTERVAL_MS = 1000;
 constexpr size_t AUDIO_PCM16_BUFFER_SIZE = MIC_SAMPLE_RATE * PACKET_INTERVAL_MS / 1000; // 1600 samples
 constexpr size_t BLE_MAX_CHUNK_BYTES = 180;
 
-static const char *DEVICE_NAME = "PAL-V2-Telemetry";
+//Change the Device Name to PAL-V2 (smaller name, less bits, can be advertised in 1 packet)
+static const char *DEVICE_NAME = "PAL-V2";
 static const char *SERVICE_UUID = "7f510001-5b8d-4a84-9c7c-a07142ab6001";
 static const char *DATA_UUID = "7f510002-5b8d-4a84-9c7c-a07142ab6001";
 static const char *COMMAND_UUID = "7f510003-5b8d-4a84-9c7c-a07142ab6001";
@@ -372,6 +373,15 @@ void setRtcFromUnixMs(uint64_t unixMs) {
 
 void handleCommand(String command) {
   command.trim();
+  Serial.print("Received command: ");
+  Serial.println(command);
+
+  //Ping Pong for App Inventor Connection
+  if (command.indexOf("ping") >= 0) {
+    sendStatus("pong", "FrED PDM link active");
+    return; 
+  }
+
   if (command.indexOf("toggle_battery_save") >= 0 || command.indexOf("battery_save") >= 0) {
     batterySaveMode = !batterySaveMode;
     if (batterySaveMode) {
@@ -429,12 +439,6 @@ void handleCommand(String command) {
     return;
   }
   setRtcFromUnixMs(unixMs);
-
-  //Ping Pong for App Inventor Connection
-  if (command.indexOf("ping") >= 0) {
-    sendStatus("pong", "FrED PDM link active");
-    return; 
-  }
 }
 
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
@@ -495,10 +499,30 @@ void beginBle() {
   server->start();
 
   NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  advertising->reset();
+
+  //Explicitly set PAL advertising paramters for discoverability 
+  advertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
+  advertising->setConnectableMode(BLE_GAP_CONN_MODE_UND);
+
+  //Puts both short name and service UUID in the primary packet
+  advertising->enableScanResponse(false); 
+
+  const bool serviceAdded = advertising->setName(DEVICE_NAME); 
+
+  //Advertise every 50-100 ms while testing
+  //Units are 0.625 ms, so 80 = 50 ms, 160 = 100 ms
+  advertising->setMinInterval(0x50); //50 ms
+  advertising->setMaxInterval(0xA0); //100 ms
+
   advertising->addServiceUUID(SERVICE_UUID);
-  advertising->setName(DEVICE_NAME);
   advertising->enableScanResponse(true);
-  advertising->start();
+  const bool advertisingStarted = advertising->start(); 
+
+  Serial.printf("BLE advertising: service=%s, name=%s, started=%s\n",
+  serviceAdded ? "OK" : "FAILED",
+  serviceAdded ? "OK" : "FAILED",
+  advertisingStarted ? "OK" : "FAILED"); 
 }
 
 void beginMicrophone() {
