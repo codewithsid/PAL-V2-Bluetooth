@@ -138,3 +138,4 @@ Open **`http://localhost:8000`** in **Google Chrome** or **Microsoft Edge**.
 * **`● Record` / `■ Stop`**: Captures sensor rows and PCM audio in browser memory.
 * **`▶ Play Audio`**: Plays back recorded 16-bit PCM microphone audio (automatically decodes ADPCM if via BLE).
 * **`💾 Export CSV`**: Exports captured session data as a formatted CSV file.
+
