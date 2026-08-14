@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include "ima_adpcm.h"
+#include "audio_spectrum.h"
 
 static inline int32_t constrainVal(int32_t val, int32_t minVal, int32_t maxVal) {
   return val < minVal ? minVal : (val > maxVal ? maxVal : val);
@@ -61,6 +64,99 @@ void test_dbfs_calculation() {
   TEST_ASSERT_FLOAT_WITHIN(0.1f, -6.02f, static_cast<float>(calculateDbfs(0.25, 1)));
   // Zero amplitude -> -120.0 dBFS floor
   TEST_ASSERT_FLOAT_WITHIN(0.01f, -120.0f, static_cast<float>(calculateDbfs(0.0, 0)));
+}
+
+void test_audio_spectrum_silence_and_near_silence() {
+  int16_t samples[pal::AUDIO_SPECTRUM_FFT_SIZE] = {};
+  float bands[pal::AUDIO_SPECTRUM_BAND_COUNT];
+
+  pal::calculateAudioSpectrumDbfs(samples, bands);
+  for (size_t i = 0; i < pal::AUDIO_SPECTRUM_BAND_COUNT; ++i) {
+    TEST_ASSERT_TRUE(std::isfinite(bands[i]));
+    TEST_ASSERT_EQUAL_FLOAT(pal::AUDIO_SPECTRUM_FLOOR_DBFS, bands[i]);
+  }
+
+  // A single one-LSB impulse is below the configured spectral floor.
+  samples[pal::AUDIO_SPECTRUM_FFT_SIZE / 2] = 1;
+  pal::calculateAudioSpectrumDbfs(samples, bands);
+  for (size_t i = 0; i < pal::AUDIO_SPECTRUM_BAND_COUNT; ++i) {
+    TEST_ASSERT_TRUE(std::isfinite(bands[i]));
+    TEST_ASSERT_EQUAL_FLOAT(pal::AUDIO_SPECTRUM_FLOOR_DBFS, bands[i]);
+  }
+}
+
+void test_audio_spectrum_sine_peak_band() {
+  constexpr uint32_t sampleRateHz = 16000;
+  constexpr float frequencyHz = 1000.0f;
+  int16_t samples[pal::AUDIO_SPECTRUM_FFT_SIZE];
+  for (size_t i = 0; i < pal::AUDIO_SPECTRUM_FFT_SIZE; ++i) {
+    samples[i] = static_cast<int16_t>(
+        16384.0f * sinf(2.0f * 3.14159265358979323846f * frequencyHz *
+                        static_cast<float>(i) / static_cast<float>(sampleRateHz)));
+  }
+
+  float bands[pal::AUDIO_SPECTRUM_BAND_COUNT];
+  pal::calculateAudioSpectrumDbfs(samples, bands);
+  size_t strongestBand = 0;
+  for (size_t i = 1; i < pal::AUDIO_SPECTRUM_BAND_COUNT; ++i) {
+    if (bands[i] > bands[strongestBand]) strongestBand = i;
+  }
+
+  // Linear 250 Hz-wide bands place 1000 Hz in zero-based band 4.
+  TEST_ASSERT_EQUAL_UINT32(4, strongestBand);
+  TEST_ASSERT_TRUE(bands[strongestBand] <= pal::AUDIO_SPECTRUM_CEILING_DBFS);
+  TEST_ASSERT_TRUE(bands[strongestBand] >= pal::AUDIO_SPECTRUM_FLOOR_DBFS);
+}
+
+void test_audio_spectrum_packet_schema_and_framing() {
+  float bands[pal::AUDIO_SPECTRUM_BAND_COUNT];
+  for (size_t i = 0; i < pal::AUDIO_SPECTRUM_BAND_COUNT; ++i) {
+    bands[i] = -100.0f + static_cast<float>(i) * 3.5f;
+  }
+  bands[0] = NAN;
+  bands[1] = INFINITY;
+
+  char packet[512];
+  TEST_ASSERT_TRUE(pal::formatAudioSpectrumPacket(
+      packet, sizeof(packet), 123456789ULL, 16000, bands));
+  TEST_ASSERT_NOT_NULL(strstr(packet, "\"type\":\"audio_spectrum\""));
+  TEST_ASSERT_NOT_NULL(strstr(packet, "\"time_ms\":123456789"));
+  TEST_ASSERT_NOT_NULL(strstr(packet, "\"sample_rate_hz\":16000"));
+  TEST_ASSERT_NOT_NULL(strstr(packet, "\"fft_size\":256"));
+  TEST_ASSERT_NOT_NULL(strstr(packet, "\"min_hz\":0"));
+  TEST_ASSERT_NOT_NULL(strstr(packet, "\"max_hz\":8000"));
+  TEST_ASSERT_NOT_NULL(strstr(packet, "\"scale\":\"linear\""));
+  TEST_ASSERT_NULL(strstr(packet, "nan"));
+  TEST_ASSERT_NULL(strstr(packet, "inf"));
+
+  // Parse the numeric array and require exactly 32 bounded JSON numbers.
+  const char *cursor = strstr(packet, "\"audio_fft\":[");
+  TEST_ASSERT_NOT_NULL(cursor);
+  cursor += strlen("\"audio_fft\":[");
+  for (size_t i = 0; i < pal::AUDIO_SPECTRUM_BAND_COUNT; ++i) {
+    char *end = nullptr;
+    const float value = strtof(cursor, &end);
+    TEST_ASSERT_TRUE(end != cursor);
+    TEST_ASSERT_TRUE(std::isfinite(value));
+    TEST_ASSERT_TRUE(value >= pal::AUDIO_SPECTRUM_FLOOR_DBFS);
+    TEST_ASSERT_TRUE(value <= pal::AUDIO_SPECTRUM_CEILING_DBFS);
+    TEST_ASSERT_EQUAL_CHAR(i + 1 == pal::AUDIO_SPECTRUM_BAND_COUNT ? ']' : ',', *end);
+    cursor = end + 1;
+  }
+  TEST_ASSERT_EQUAL_CHAR('}', *cursor);
+  TEST_ASSERT_EQUAL_CHAR('\0', *(cursor + 1));
+
+  const std::string framed = std::string(packet) + '\n';
+  TEST_ASSERT_EQUAL_CHAR('\n', framed.back());
+  TEST_ASSERT_EQUAL_UINT32(strlen(packet) + 1, framed.size());
+}
+
+void test_audio_spectrum_rate_limiter() {
+  TEST_ASSERT_FALSE(pal::audioSpectrumPacketDue(199, 0, 200, true));
+  TEST_ASSERT_TRUE(pal::audioSpectrumPacketDue(200, 0, 200, true));
+  TEST_ASSERT_FALSE(pal::audioSpectrumPacketDue(400, 200, 200, false));
+  TEST_ASSERT_TRUE(pal::audioSpectrumPacketDue(400, 200, 200, true));
+  TEST_ASSERT_TRUE(pal::audioSpectrumPacketDue(100, UINT32_MAX - 149, 200, true));
 }
 
 
@@ -293,6 +389,10 @@ int main(int argc, char **argv) {
   RUN_TEST(test_base64_encoding);
   RUN_TEST(test_pcm_quantization);
   RUN_TEST(test_dbfs_calculation);
+  RUN_TEST(test_audio_spectrum_silence_and_near_silence);
+  RUN_TEST(test_audio_spectrum_sine_peak_band);
+  RUN_TEST(test_audio_spectrum_packet_schema_and_framing);
+  RUN_TEST(test_audio_spectrum_rate_limiter);
   RUN_TEST(test_battery_percentage);
   RUN_TEST(test_neopixel_status_priority);
   RUN_TEST(test_battery_save_pulse_math);

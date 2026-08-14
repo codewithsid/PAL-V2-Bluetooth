@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <math.h>
 #include "ima_adpcm.h"
+#include "audio_spectrum.h"
 
 // Feather V2 pin labels: A0=GPIO26, A1=GPIO25, A5=GPIO4.
 // A3/GPIO39 is input-only and cannot generate LRCL. Rewire LRCL to A5.
@@ -35,6 +36,12 @@ constexpr size_t AUDIO_PCM16_BUFFER_SIZE = MIC_SAMPLE_RATE * PACKET_INTERVAL_MS 
 constexpr size_t BLE_MAX_CHUNK_BYTES = 180;
 constexpr uint32_t BLE_STALL_TIMEOUT_MS = 30000;
 constexpr uint32_t BLE_CHUNK_GAP_MS = 2;
+// Set false at compile time to preserve the pre-spectrum behavior exactly.
+constexpr bool AUDIO_SPECTRUM_ENABLED = true;
+constexpr uint32_t AUDIO_SPECTRUM_INTERVAL_MS = 200; // maximum 5 packets/second
+constexpr size_t AUDIO_SPECTRUM_PACKET_BUFFER_SIZE = 512;
+static_assert(AUDIO_SPECTRUM_INTERVAL_MS >= 200,
+              "Audio spectrum output must not exceed 5 packets per second");
 
 //Change the Device Name to PAL-V2 (smaller name, less bits, can be advertised in 1 packet)
 static const char *DEVICE_NAME = "PAL-V2";
@@ -72,6 +79,7 @@ uint32_t clockBaseMillis = 0;
 uint32_t lastImuMs = 0;
 uint32_t lastPacketMs = 0;
 uint32_t lastEnvMs = 0;
+uint32_t lastAudioSpectrumMs = 0;
 uint32_t lastLedUpdateMs = 0;
 volatile uint32_t lastBleActivityMs = 0;
 uint32_t bmeReadyAtMs = 0;
@@ -81,6 +89,9 @@ double audioSquareSum = 0.0;
 uint32_t audioSampleCount = 0;
 int16_t audioPcm16Samples[AUDIO_PCM16_BUFFER_SIZE];
 size_t audioPcm16Count = 0;
+int16_t audioSpectrumSamples[pal::AUDIO_SPECTRUM_FFT_SIZE];
+size_t audioSpectrumSampleCount = 0;
+volatile bool audioSpectrumReady = false;
 ImaAdpcmEncoder bleAdpcmEncoder;
 
 struct CommandMessage {
@@ -613,6 +624,16 @@ void readMicrophone() {
         audioPcm16Samples[audioPcm16Count++] = pcmBuf[i];
       }
     }
+    if (AUDIO_SPECTRUM_ENABLED && !audioSpectrumReady) {
+      for (size_t i = 0;
+           i < pcmCount && audioSpectrumSampleCount < pal::AUDIO_SPECTRUM_FFT_SIZE;
+           ++i) {
+        audioSpectrumSamples[audioSpectrumSampleCount++] = pcmBuf[i];
+      }
+      if (audioSpectrumSampleCount == pal::AUDIO_SPECTRUM_FFT_SIZE) {
+        audioSpectrumReady = true;
+      }
+    }
   }
 }
 
@@ -771,6 +792,33 @@ void sendTelemetryPacket() {
   imuCount = 0;
 }
 
+bool sendAudioSpectrumPacket() {
+  if (!AUDIO_SPECTRUM_ENABLED) return false;
+
+  int16_t samples[pal::AUDIO_SPECTRUM_FFT_SIZE];
+  {
+    AudioLock lock;
+    if (!audioSpectrumReady ||
+        audioSpectrumSampleCount != pal::AUDIO_SPECTRUM_FFT_SIZE) {
+      return false;
+    }
+    memcpy(samples, audioSpectrumSamples, sizeof(samples));
+    audioSpectrumSampleCount = 0;
+    audioSpectrumReady = false;
+  }
+
+  float bandsDbfs[pal::AUDIO_SPECTRUM_BAND_COUNT];
+  pal::calculateAudioSpectrumDbfs(samples, bandsDbfs);
+
+  char packet[AUDIO_SPECTRUM_PACKET_BUFFER_SIZE];
+  if (!pal::formatAudioSpectrumPacket(packet, sizeof(packet), nowUnixMs(),
+                                      MIC_SAMPLE_RATE, bandsDbfs)) {
+    return false;
+  }
+  enqueueTelemetry(String(packet));
+  return true;
+}
+
 void sendEnvironment() {
   bool bmeSuccess = false;
   float tempC = 0.0f, humPct = 0.0f, pressPa = 0.0f;
@@ -887,6 +935,12 @@ void sensor_app_task(void *pvParameters) {
     if (now - lastPacketMs >= PACKET_INTERVAL_MS) {
       sendTelemetryPacket();
       lastPacketMs = now;
+    }
+    if (pal::audioSpectrumPacketDue(now, lastAudioSpectrumMs,
+                                    AUDIO_SPECTRUM_INTERVAL_MS,
+                                    audioSpectrumReady) &&
+        sendAudioSpectrumPacket()) {
+      lastAudioSpectrumMs = now;
     }
     if (bmeReading && static_cast<int32_t>(now - bmeReadyAtMs) >= 0) {
       sendEnvironment();

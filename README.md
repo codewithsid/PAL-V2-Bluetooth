@@ -81,7 +81,30 @@ Contains an array of unpacked IMU hardware FIFO samples `[offset_ms, ax, ay, az,
 ```
 *(Note: Uses `audio_pcm_s16_b64` over USB and `audio_adpcm_b64` over BLE).*
 
-### 3. GATT Services & Characteristics
+### 3. Audio Spectrum Packet (5 Hz maximum)
+
+The optional spectrum stream is a separate packet, so existing telemetry and environment consumers do not need to change. It uses the real 16 kHz microphone sample rate and contains exactly 32 finite dBFS values:
+
+```json
+{
+  "type": "audio_spectrum",
+  "time_ms": 1785185533369,
+  "sample_rate_hz": 16000,
+  "fft_size": 256,
+  "min_hz": 0,
+  "max_hz": 8000,
+  "scale": "linear",
+  "audio_fft": [-100.0, -100.0, -99.4, -96.1, -71.8, -54.2, -31.6, -47.5, -79.2, -91.0, -96.3, -98.4, -99.1, -99.5, -99.8, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+}
+```
+
+`audio_fft` uses a 256-sample Hann window and a single-sided radix-2 FFT. The 129 bins from DC through Nyquist are assigned to 32 equal-width linear bands (250 Hz per band at 16 kHz). Each band is the RMS amplitude derived from the **mean power** of its bins, expressed in dBFS. Values are clamped to `-100.0` through `0.0` dBFS; zero or non-finite results become `-100.0`. A packet is skipped until a complete 256-sample window is available.
+
+`AUDIO_SPECTRUM_ENABLED` in `src/main.cpp` is the compile-time feature flag and defaults to `true`. `AUDIO_SPECTRUM_INTERVAL_MS` defaults to 200 ms (5 packets/s); it must not be set below 200 ms. Setting the enable flag to `false` removes the capture, FFT, JSON, and transmission work while leaving all prior packet behavior unchanged.
+
+A typical compact packet is about 330-370 bytes, depending on the timestamp and values. At 5 Hz this is approximately 1.7-1.9 kB/s of JSON payload before BLE link-layer overhead. With the requested MTU 247 and the firmware's 180-byte chunk cap, most packets require two or three data notifications plus the existing newline notification. Persistent RAM cost is 512 bytes for the sample window plus a few counters; peak task-stack working storage is approximately 3 KiB for the FFT arrays, snapshot, band values, and JSON buffer. Processing is one 256-point FFT every 200 ms and does not alter I2S DMA timing.
+
+### 4. GATT Services & Characteristics
 * **Service UUID**: `7f510001-5b8d-4a84-9c7c-a07142ab6001`
 * **Data Characteristic (Notify/Read)**: `7f510002-5b8d-4a84-9c7c-a07142ab6001`
 * **Command Characteristic (Write)**: `7f510003-5b8d-4a84-9c7c-a07142ab6001`
