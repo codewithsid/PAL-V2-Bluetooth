@@ -15,6 +15,7 @@
 #include <math.h>
 #include "ima_adpcm.h"
 #include "audio_spectrum.h"
+#include "telemetry_message_queue.h"
 
 // Feather V2 pin labels: A0=GPIO26, A1=GPIO25, A5=GPIO4.
 // A3/GPIO39 is input-only and cannot generate LRCL. Rewire LRCL to A5.
@@ -36,9 +37,11 @@ constexpr size_t AUDIO_PCM16_BUFFER_SIZE = MIC_SAMPLE_RATE * PACKET_INTERVAL_MS 
 constexpr size_t BLE_MAX_CHUNK_BYTES = 180;
 constexpr uint32_t BLE_STALL_TIMEOUT_MS = 30000;
 constexpr uint32_t BLE_CHUNK_GAP_MS = 2;
+constexpr uint8_t BLE_NOTIFY_MAX_RETRIES = 10;
+constexpr size_t TELEMETRY_QUEUE_CAPACITY = 16;
 // Set false at compile time to preserve the pre-spectrum behavior exactly.
 constexpr bool AUDIO_SPECTRUM_ENABLED = true;
-constexpr uint32_t AUDIO_SPECTRUM_INTERVAL_MS = 200; // maximum 5 packets/second
+constexpr uint32_t AUDIO_SPECTRUM_INTERVAL_MS = 1000; // initial safe rate: 1 packet/second
 constexpr size_t AUDIO_SPECTRUM_PACKET_BUFFER_SIZE = 512;
 static_assert(AUDIO_SPECTRUM_INTERVAL_MS >= 200,
               "Audio spectrum output must not exceed 5 packets per second");
@@ -99,9 +102,10 @@ struct CommandMessage {
 };
 
 QueueHandle_t commandQueue = nullptr;
-QueueHandle_t telemetryQueue = nullptr;
+pal::TelemetryMessageQueue<TELEMETRY_QUEUE_CAPACITY> telemetryQueue;
 SemaphoreHandle_t i2cMutex = nullptr;
 SemaphoreHandle_t audioMutex = nullptr;
+SemaphoreHandle_t telemetryQueueMutex = nullptr;
 
 bool batterySaveMode = false;
 
@@ -329,57 +333,68 @@ void syncClockBase() {
   clockBaseMillis = millis();
 }
 
-void sendLine(const String &line) {
-  Serial.println(line);
+// The telemetry_net_task is the sole runtime owner of this function and the
+// only code allowed to notify the BLE telemetry characteristic.
+void transmitOwnedMessage(const pal::OwnedTelemetryMessage &message) {
+  Serial.write(reinterpret_cast<const uint8_t *>(message.data), message.length);
   if (dataCharacteristic == nullptr || !bleSubscribed) {
     return;
   }
 
   const size_t chunkBytes = bleChunkBytes;
   const uint16_t connectionHandle = bleConnectionHandle;
-  bool notifySuccess = true;
-
-  for (size_t start = 0; start < line.length(); start += chunkBytes) {
-    const size_t length = min(chunkBytes, line.length() - start);
-    if (dataCharacteristic->notify(reinterpret_cast<const uint8_t *>(line.c_str() + start), length, connectionHandle)) {
-      lastBleActivityMs = millis();
-    } else {
-      notifySuccess = false;
-      break;
+  for (size_t start = 0; start < message.length; start += chunkBytes) {
+    const size_t length = min(chunkBytes, message.length - start);
+    bool sent = false;
+    for (uint8_t attempt = 0; attempt < BLE_NOTIFY_MAX_RETRIES; ++attempt) {
+      if (!bleSubscribed || bleConnectionHandle != connectionHandle) return;
+      if (dataCharacteristic->notify(
+              reinterpret_cast<const uint8_t *>(message.data + start), length,
+              connectionHandle)) {
+        lastBleActivityMs = millis();
+        sent = true;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(BLE_CHUNK_GAP_MS));
     }
-    if (start + length < line.length()) {
+    if (!sent) {
+      // Never continue a JSONL stream after a partial packet. Disconnecting
+      // forces the receiver to discard its incomplete line before reconnect.
+      Serial.println("BLE notification stalled; disconnecting partial JSONL stream");
+      performSafeBleDisconnect();
+      return;
+    }
+    if (start + length < message.length) {
       vTaskDelay(pdMS_TO_TICKS(BLE_CHUNK_GAP_MS));
     }
   }
-
-  if (notifySuccess) {
-    const uint8_t newline = '\n';
-    if (dataCharacteristic->notify(&newline, 1, connectionHandle)) {
-      lastBleActivityMs = millis();
-    } else {
-      notifySuccess = false;
-    }
-  }
-
-  // A false return commonly means the controller's notification queue is
-  // temporarily full. Keep the GATT link alive; the inactivity watchdog will
-  // recover a genuinely stalled connection after BLE_STALL_TIMEOUT_MS.
-  if (!notifySuccess) Serial.println("BLE notification dropped (queue busy)");
 }
 
-void enqueueTelemetry(const String &line) {
-  if (telemetryQueue == nullptr) return;
-  char *msg = strdup(line.c_str());
-  if (msg == nullptr) return;
-  if (xQueueSend(telemetryQueue, &msg, 0) != pdTRUE) {
-    free(msg);
+pal::EnqueueResult enqueueTelemetry(
+    const String &json,
+    pal::MessagePriority priority = pal::MessagePriority::NORMAL) {
+  if (telemetryQueueMutex == nullptr) {
+    return pal::EnqueueResult::DROPPED_INCOMING;
   }
+  xSemaphoreTake(telemetryQueueMutex, portMAX_DELAY);
+  const pal::EnqueueResult result =
+      telemetryQueue.enqueueJsonCopy(json.c_str(), json.length(), priority);
+  xSemaphoreGive(telemetryQueueMutex);
+  return result;
+}
+
+bool dequeueTelemetry(pal::OwnedTelemetryMessage &message) {
+  if (telemetryQueueMutex == nullptr) return false;
+  xSemaphoreTake(telemetryQueueMutex, portMAX_DELAY);
+  const bool dequeued = telemetryQueue.dequeue(message);
+  xSemaphoreGive(telemetryQueueMutex);
+  return dequeued;
 }
 
 void sendStatus(const char *state, const char *detail) {
   String message = "{\"type\":\"status\",\"time_ms\":" + String(nowUnixMs()) +
                    ",\"state\":\"" + state + "\",\"detail\":\"" + detail + "\"}";
-  enqueueTelemetry(message);
+  enqueueTelemetry(message, pal::MessagePriority::RESPONSE);
 }
 
 void setRtcFromUnixMs(uint64_t unixMs) {
@@ -815,7 +830,7 @@ bool sendAudioSpectrumPacket() {
                                       MIC_SAMPLE_RATE, bandsDbfs)) {
     return false;
   }
-  enqueueTelemetry(String(packet));
+  enqueueTelemetry(String(packet), pal::MessagePriority::SPECTRUM);
   return true;
 }
 
@@ -908,12 +923,10 @@ void telemetry_net_task(void *pvParameters) {
     readSerialCommands();
     readMicrophone();
 
-    char *msg = nullptr;
-    while (telemetryQueue != nullptr && xQueueReceive(telemetryQueue, &msg, 0) == pdTRUE) {
-      if (msg != nullptr) {
-        sendLine(String(msg));
-        free(msg);
-      }
+    pal::OwnedTelemetryMessage message;
+    while (dequeueTelemetry(message)) {
+      transmitOwnedMessage(message);
+      pal::releaseTelemetryMessage(message);
     }
 
     checkBleSafetyTimeout();
@@ -965,7 +978,7 @@ void setup() {
 
   i2cMutex = xSemaphoreCreateMutex();
   audioMutex = xSemaphoreCreateMutex();
-  telemetryQueue = xQueueCreate(16, sizeof(char *));
+  telemetryQueueMutex = xSemaphoreCreateMutex();
   commandQueue = xQueueCreate(8, sizeof(CommandMessage));
 
   pinMode(STATUS_NEOPIXEL_POWER_PIN, OUTPUT);

@@ -5,8 +5,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include "ima_adpcm.h"
 #include "audio_spectrum.h"
+#include "telemetry_message_queue.h"
 
 static inline int32_t constrainVal(int32_t val, int32_t minVal, int32_t maxVal) {
   return val < minVal ? minVal : (val > maxVal ? maxVal : val);
@@ -157,6 +162,186 @@ void test_audio_spectrum_rate_limiter() {
   TEST_ASSERT_FALSE(pal::audioSpectrumPacketDue(400, 200, 200, false));
   TEST_ASSERT_TRUE(pal::audioSpectrumPacketDue(400, 200, 200, true));
   TEST_ASSERT_TRUE(pal::audioSpectrumPacketDue(100, UINT32_MAX - 149, 200, true));
+}
+
+bool parseSingleJsonObject(const std::string &line) {
+  if (line.size() < 2 || line.front() != '{' || line.back() != '}') return false;
+  bool inString = false;
+  bool escaped = false;
+  int objectDepth = 0;
+  int arrayDepth = 0;
+  for (size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inString = true;
+    } else if (c == '{') {
+      ++objectDepth;
+    } else if (c == '}') {
+      if (--objectDepth < 0) return false;
+      if (objectDepth == 0 && i + 1 != line.size()) return false;
+    } else if (c == '[') {
+      ++arrayDepth;
+    } else if (c == ']') {
+      if (--arrayDepth < 0) return false;
+    }
+  }
+  return !inString && !escaped && objectDepth == 0 && arrayDepth == 0;
+}
+
+void appendFragments(const pal::OwnedTelemetryMessage &message, size_t mtuPayload,
+                     std::string &wire) {
+  for (size_t start = 0; start < message.length; start += mtuPayload) {
+    const size_t length = std::min(mtuPayload, message.length - start);
+    wire.append(message.data + start, length);
+  }
+}
+
+std::vector<std::string> reconstructJsonLines(const std::string &wire) {
+  std::vector<std::string> lines;
+  size_t start = 0;
+  while (start < wire.size()) {
+    const size_t newline = wire.find('\n', start);
+    if (newline == std::string::npos) break;
+    lines.push_back(wire.substr(start, newline - start));
+    start = newline + 1;
+  }
+  return lines;
+}
+
+void test_message_queue_drop_policy_and_priority() {
+  pal::TelemetryMessageQueue<3> queue;
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(pal::EnqueueResult::ENQUEUED),
+      static_cast<int>(queue.enqueueJsonCopy(
+          "{\"type\":\"telemetry\"}", strlen("{\"type\":\"telemetry\"}"),
+          pal::MessagePriority::NORMAL)));
+  queue.enqueueJsonCopy("{\"type\":\"audio_spectrum\",\"seq\":1}",
+                        strlen("{\"type\":\"audio_spectrum\",\"seq\":1}"),
+                        pal::MessagePriority::SPECTRUM);
+  queue.enqueueJsonCopy("{\"type\":\"environment\"}",
+                        strlen("{\"type\":\"environment\"}"),
+                        pal::MessagePriority::NORMAL);
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(pal::EnqueueResult::REPLACED_SPECTRUM),
+      static_cast<int>(queue.enqueueJsonCopy(
+          "{\"type\":\"status\",\"state\":\"pong\"}",
+          strlen("{\"type\":\"status\",\"state\":\"pong\"}"),
+          pal::MessagePriority::RESPONSE)));
+
+  pal::OwnedTelemetryMessage message;
+  TEST_ASSERT_TRUE(queue.dequeue(message));
+  TEST_ASSERT_NOT_NULL(strstr(message.data, "\"state\":\"pong\""));
+  pal::releaseTelemetryMessage(message);
+  TEST_ASSERT_TRUE(queue.dequeue(message));
+  TEST_ASSERT_NOT_NULL(strstr(message.data, "\"type\":\"telemetry\""));
+  pal::releaseTelemetryMessage(message);
+  TEST_ASSERT_TRUE(queue.dequeue(message));
+  TEST_ASSERT_NOT_NULL(strstr(message.data, "\"type\":\"environment\""));
+  pal::releaseTelemetryMessage(message);
+  TEST_ASSERT_FALSE(queue.dequeue(message));
+}
+
+void test_concurrent_producers_never_interleave_fragments() {
+  constexpr size_t producerCount = 4;
+  constexpr size_t messagesPerProducer = 20;
+  pal::TelemetryMessageQueue<producerCount * messagesPerProducer> queue;
+  std::mutex queueMutex;
+  std::atomic<size_t> producersRemaining(producerCount);
+  std::atomic<bool> enqueueFailed(false);
+  std::string wire;
+
+  std::thread consumer([&]() {
+    for (;;) {
+      pal::OwnedTelemetryMessage message;
+      bool dequeued = false;
+      {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        dequeued = queue.dequeue(message);
+        if (!dequeued && producersRemaining.load() == 0 && queue.size() == 0) break;
+      }
+      if (dequeued) {
+        appendFragments(message, 17, wire);
+        pal::releaseTelemetryMessage(message);
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  std::vector<std::thread> producers;
+  for (size_t producer = 0; producer < producerCount; ++producer) {
+    producers.emplace_back([&, producer]() {
+      for (size_t sequence = 0; sequence < messagesPerProducer; ++sequence) {
+        const std::string json =
+            "{\"type\":\"telemetry\",\"producer\":" + std::to_string(producer) +
+            ",\"sequence\":" + std::to_string(sequence) + "}";
+        std::lock_guard<std::mutex> lock(queueMutex);
+        if (queue.enqueueJsonCopy(json.c_str(), json.size(),
+                                  pal::MessagePriority::NORMAL) !=
+            pal::EnqueueResult::ENQUEUED) {
+          enqueueFailed = true;
+        }
+      }
+      --producersRemaining;
+    });
+  }
+  for (std::thread &producer : producers) producer.join();
+  consumer.join();
+
+  TEST_ASSERT_FALSE(enqueueFailed.load());
+  TEST_ASSERT_FALSE(wire.empty());
+  TEST_ASSERT_EQUAL_CHAR('\n', wire.back());
+  const std::vector<std::string> lines = reconstructJsonLines(wire);
+  TEST_ASSERT_EQUAL_UINT32(producerCount * messagesPerProducer, lines.size());
+  for (const std::string &line : lines) TEST_ASSERT_TRUE(parseSingleJsonObject(line));
+}
+
+void test_mixed_packet_stress_reconstructs_json_lines() {
+  pal::TelemetryMessageQueue<8> queue;
+  std::mutex queueMutex;
+  const char *json[] = {
+      "{\"type\":\"telemetry\",\"audio_dbfs\":-42.0}",
+      "{\"type\":\"environment\",\"battery_v\":3.43,\"battery_pct\":14}",
+      "{\"type\":\"audio_spectrum\",\"audio_fft\":[-100.0,-80.0]}",
+      "{\"type\":\"status\",\"state\":\"pong\"}",
+  };
+  const pal::MessagePriority priorities[] = {
+      pal::MessagePriority::NORMAL, pal::MessagePriority::NORMAL,
+      pal::MessagePriority::SPECTRUM, pal::MessagePriority::RESPONSE,
+  };
+
+  std::vector<std::thread> producers;
+  for (size_t i = 0; i < 4; ++i) {
+    producers.emplace_back([&, i]() {
+      std::lock_guard<std::mutex> lock(queueMutex);
+      queue.enqueueJsonCopy(json[i], strlen(json[i]), priorities[i]);
+    });
+  }
+  for (std::thread &producer : producers) producer.join();
+
+  std::string wire;
+  pal::OwnedTelemetryMessage message;
+  while (queue.dequeue(message)) {
+    appendFragments(message, 13, wire);
+    pal::releaseTelemetryMessage(message);
+  }
+  TEST_ASSERT_FALSE(wire.empty());
+  TEST_ASSERT_EQUAL_CHAR('\n', wire.back());
+  const std::vector<std::string> lines = reconstructJsonLines(wire);
+  TEST_ASSERT_EQUAL_UINT32(4, lines.size());
+  for (const std::string &line : lines) TEST_ASSERT_TRUE(parseSingleJsonObject(line));
+  TEST_ASSERT_NOT_NULL(strstr(lines.front().c_str(), "\"state\":\"pong\""));
+  TEST_ASSERT_NOT_NULL(strstr(lines.back().c_str(), "\"type\":\"audio_spectrum\""));
 }
 
 
@@ -393,6 +578,9 @@ int main(int argc, char **argv) {
   RUN_TEST(test_audio_spectrum_sine_peak_band);
   RUN_TEST(test_audio_spectrum_packet_schema_and_framing);
   RUN_TEST(test_audio_spectrum_rate_limiter);
+  RUN_TEST(test_message_queue_drop_policy_and_priority);
+  RUN_TEST(test_concurrent_producers_never_interleave_fragments);
+  RUN_TEST(test_mixed_packet_stress_reconstructs_json_lines);
   RUN_TEST(test_battery_percentage);
   RUN_TEST(test_neopixel_status_priority);
   RUN_TEST(test_battery_save_pulse_math);

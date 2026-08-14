@@ -81,7 +81,7 @@ Contains an array of unpacked IMU hardware FIFO samples `[offset_ms, ax, ay, az,
 ```
 *(Note: Uses `audio_pcm_s16_b64` over USB and `audio_adpcm_b64` over BLE).*
 
-### 3. Audio Spectrum Packet (5 Hz maximum)
+### 3. Audio Spectrum Packet (1 Hz initial rate, 5 Hz maximum)
 
 The optional spectrum stream is a separate packet, so existing telemetry and environment consumers do not need to change. It uses the real 16 kHz microphone sample rate and contains exactly 32 finite dBFS values:
 
@@ -100,16 +100,18 @@ The optional spectrum stream is a separate packet, so existing telemetry and env
 
 `audio_fft` uses a 256-sample Hann window and a single-sided radix-2 FFT. The 129 bins from DC through Nyquist are assigned to 32 equal-width linear bands (250 Hz per band at 16 kHz). Each band is the RMS amplitude derived from the **mean power** of its bins, expressed in dBFS. Values are clamped to `-100.0` through `0.0` dBFS; zero or non-finite results become `-100.0`. A packet is skipped until a complete 256-sample window is available.
 
-`AUDIO_SPECTRUM_ENABLED` in `src/main.cpp` is the compile-time feature flag and defaults to `true`. `AUDIO_SPECTRUM_INTERVAL_MS` defaults to 200 ms (5 packets/s); it must not be set below 200 ms. Setting the enable flag to `false` removes the capture, FFT, JSON, and transmission work while leaving all prior packet behavior unchanged.
+`AUDIO_SPECTRUM_ENABLED` in `src/main.cpp` is the compile-time feature flag and defaults to `true`. `AUDIO_SPECTRUM_INTERVAL_MS` initially defaults to 1000 ms (1 packet/s) for hardware validation; a compile-time assertion prevents settings below 200 ms (more than 5 packets/s). Setting the enable flag to `false` removes the capture, FFT, JSON, and transmission work while leaving all prior packet behavior unchanged.
 
-A typical compact packet is about 330-370 bytes, depending on the timestamp and values. At 5 Hz this is approximately 1.7-1.9 kB/s of JSON payload before BLE link-layer overhead. With the requested MTU 247 and the firmware's 180-byte chunk cap, most packets require two or three data notifications plus the existing newline notification. Persistent RAM cost is 512 bytes for the sample window plus a few counters; peak task-stack working storage is approximately 3 KiB for the FFT arrays, snapshot, band values, and JSON buffer. Processing is one 256-point FFT every 200 ms and does not alter I2S DMA timing.
+A typical compact packet is about 330-370 bytes, depending on the timestamp and values. At the initial 1 Hz rate this is approximately 0.33-0.37 kB/s of JSON payload before BLE link-layer overhead (1.7-1.9 kB/s at the enforced 5 Hz maximum). With the requested MTU 247 and the firmware's 180-byte chunk cap, most packets require two or three notifications. Persistent RAM cost is 512 bytes for the sample window plus a few counters; peak task-stack working storage is approximately 3 KiB for the FFT arrays, snapshot, band values, and JSON buffer. Processing is one 256-point FFT per configured interval and does not alter I2S DMA timing.
 
 ### 4. GATT Services & Characteristics
 * **Service UUID**: `7f510001-5b8d-4a84-9c7c-a07142ab6001`
 * **Data Characteristic (Notify/Read)**: `7f510002-5b8d-4a84-9c7c-a07142ab6001`
 * **Command Characteristic (Write)**: `7f510003-5b8d-4a84-9c7c-a07142ab6001`
 
-BLE messages use UTF-8 JSON Lines framing. The data characteristic splits a JSON object across MTU-sized notifications and sends `\n` after the final fragment. App Inventor must concatenate `StringsReceived` fragments until the newline arrives, then decode the complete JSON object. After notification registration succeeds, PAL emits a `status` packet with `state` set to `ble_ready`; sending `{"cmd":"ping"}` returns a `status` packet with `state` set to `pong`.
+BLE messages use UTF-8 JSON Lines framing. Every producer submits a complete JSON object to the owned-message queue, which appends exactly one `\n`. The single network task dequeues one message and sends all of its MTU-sized fragments—including the trailing newline—before it starts another message. App Inventor must concatenate `StringsReceived` fragments until the newline arrives, then decode the complete JSON object. After notification registration succeeds, PAL emits a `status` packet with `state` set to `ble_ready`; sending `{"cmd":"ping"}` returns a `status` packet with `state` set to `pong`.
+
+Status/command responses have highest queue priority, telemetry and environment packets are next, and spectrum packets are last. The queue holds 16 owned messages. When full, any pending spectrum packet is evicted first; a new spectrum packet can never displace telemetry, environment, or responses. If no spectrum is pending, a response may displace the oldest normal packet; otherwise a full queue rejects the incoming lower-priority packet. Each enqueued buffer remains owned and immutable until the network task finishes every fragment and releases it. A persistent notification failure disconnects BLE rather than allowing later packets to follow a partial JSON line.
 
 For MIT App Inventor, request MTU 247 before calling `RegisterForStrings` when possible. The default 23-byte MTU is supported, but requires many more notification fragments.
 
